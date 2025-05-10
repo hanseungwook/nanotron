@@ -422,7 +422,6 @@ class TokenizedBytesFolderDataset(DatatroveFolderDataset):
             filename_pattern=filename_pattern,
             recursive=recursive,
             token_size=token_size,
-            max_tokens=max_tokens,
             shuffle=shuffle,
             seed=seed,
             return_positions=return_positions,
