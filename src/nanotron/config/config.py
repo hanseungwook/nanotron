@@ -187,7 +187,7 @@ class NanosetDatasetsArgs:
                         tokenizer_name, token_size_in_bytes = first_line.split("|")
                         tokenizer_path = Path(tokenizer_name)
                         if tokenizer_path.is_file():
-                            tokenizer_name = tokenizer_path.parent
+                            tokenizer_name = str(tokenizer_path.parent)
                         if self.tokenizer_name is None:
                             self.tokenizer_name = tokenizer_name
                             self.token_size_in_bytes = int(token_size_in_bytes)
