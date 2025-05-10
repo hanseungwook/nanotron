@@ -7,6 +7,9 @@ from typing import Optional, Tuple, List
 # Import flash_attn functions (requires flash-attn installed)
 from flash_attn import flash_attn_func, flash_attn_varlen_func
 
+# Set default dtype to bfloat16 as FlashAttention only supports fp16 and bf16
+torch.set_default_dtype(torch.bfloat16)
+
 
 class DocumentAwareFlashAttention(torch.nn.Module):
     """
@@ -268,6 +271,9 @@ def test_document_masking_with_position_ids():
 
     device = torch.device("cuda")
 
+    # Ensure we're using bfloat16 for Flash Attention compatibility
+    print(f"Using dtype: {torch.get_default_dtype()}")
+
     # Parameters
     batch_size = 1  # We'll use a single batch for packed sequences
     hidden_size = 128
@@ -291,10 +297,10 @@ def test_document_masking_with_position_ids():
             position_ids[0, current_pos + i] = i
         current_pos += seq_len
 
-    # Create QKV for testing
-    q = torch.randn(batch_size, total_seq_len, hidden_size, device=device)
-    k = torch.randn(batch_size, total_seq_len, hidden_size, device=device)
-    v = torch.randn(batch_size, total_seq_len, hidden_size, device=device)
+    # Create QKV for testing - using bfloat16 for Flash Attention compatibility
+    q = torch.randn(batch_size, total_seq_len, hidden_size, device=device, dtype=torch.bfloat16)
+    k = torch.randn(batch_size, total_seq_len, hidden_size, device=device, dtype=torch.bfloat16)
+    v = torch.randn(batch_size, total_seq_len, hidden_size, device=device, dtype=torch.bfloat16)
 
     # Create our document-aware attention module
     attn = DocumentAwareFlashAttention(hidden_size, num_heads, dropout_prob=0.0)
@@ -444,9 +450,9 @@ def benchmark_document_masking(seq_lengths=None):
     print(f"Testing with {len(seq_lengths)} sequences, total length {total_seq_len}")
 
     # Create input tensors
-    q = torch.randn(batch_size, total_seq_len, hidden_size, device=device, dtype=torch.float16)
-    k = torch.randn(batch_size, total_seq_len, hidden_size, device=device, dtype=torch.float16)
-    v = torch.randn(batch_size, total_seq_len, hidden_size, device=device, dtype=torch.float16)
+    q = torch.randn(batch_size, total_seq_len, hidden_size, device=device, dtype=torch.bfloat16)
+    k = torch.randn(batch_size, total_seq_len, hidden_size, device=device, dtype=torch.bfloat16)
+    v = torch.randn(batch_size, total_seq_len, hidden_size, device=device, dtype=torch.bfloat16)
 
     # Create position IDs
     position_ids = torch.zeros((batch_size, total_seq_len), dtype=torch.long, device=device)
@@ -468,11 +474,11 @@ def benchmark_document_masking(seq_lengths=None):
         document_mask[0, 0, start_idx : start_idx + seq_len, start_idx : start_idx + seq_len] = 1
         start_idx += seq_len
 
-    # Convert to half precision for fair comparison
-    q = q.half()
-    k = k.half()
-    v = v.half()
-    document_mask = document_mask.half()
+    # Convert to bfloat16 for Flash Attention compatibility
+    q = q.to(torch.bfloat16)
+    k = k.to(torch.bfloat16)
+    v = v.to(torch.bfloat16)
+    document_mask = document_mask.to(torch.bfloat16)
 
     # Warmup
     for _ in range(10):
