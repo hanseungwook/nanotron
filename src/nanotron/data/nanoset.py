@@ -66,9 +66,7 @@ class Nanoset(torch.utils.data.Dataset):
             self.datatrove_datasets.append(
                 DatatroveFolderDataset(
                     folder_path=dataset_folder,
-                    filename_pattern=os.path.join(dataset_folder, "*.ds"),
                     seq_len=sequence_length,
-                    recursive=False,
                     token_size=self.token_size,
                     shuffle=True,
                     return_positions=self.return_positions,  # if set to True, the position ids are directly build datatrove
