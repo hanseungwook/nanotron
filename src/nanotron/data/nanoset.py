@@ -72,7 +72,6 @@ class Nanoset(torch.utils.data.Dataset):
                     token_size=self.token_size,
                     shuffle=True,
                     return_positions=self.return_positions,  # if set to True, the position ids are directly build datatrove
-                    eos_token_id=self.eos_token_id,
                 )
             )
 
