@@ -425,10 +425,6 @@ class TokenizedBytesFolderDataset(DatatroveFolderDataset):
             shuffle=shuffle,
             seed=seed,
             return_positions=return_positions,
-            eos_token_id=eos_token_id,
-            read_path=folder_read_path,
-            matched_files=matched_files,
-            file_sizes=file_sizes,
         )
 
         self.subset_log = TBFolderDatasetLog(
