@@ -879,12 +879,13 @@ class DistributedTrainer:
 
             # Log consumption statistics
             if hasattr(self.current_base_dl, "dataset"):
-                for dataset_name, stats in self.current_base_dl.dataset.get_consumption_stats().items():
-                    basic_log_entries.extend(
-                        [
-                            LogItem(f"dataloader/consumed_tokens/{dataset_name}", stats["tokens"], "human_format"),
-                        ]
-                    )
+                if hasattr(self.current_base_dl.dataset, "get_consumption_stats"):
+                    for dataset_name, stats in self.current_base_dl.dataset.get_consumption_stats().items():
+                        basic_log_entries.extend(
+                            [
+                                LogItem(f"dataloader/consumed_tokens/{dataset_name}", stats["tokens"], "human_format"),
+                            ]
+                        )
 
         # WandB logging - determine if this rank should log to wandb
         should_log_to_wandb = wandb is not None and (
