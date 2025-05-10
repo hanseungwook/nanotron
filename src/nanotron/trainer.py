@@ -572,22 +572,24 @@ class DistributedTrainer:
 
                 # Update consumption tracking for current batch
                 if hasattr(self.current_base_dl, "dataset"):
-                    self.current_base_dl.dataset.update_consumption_metrics(
-                        start_idx=(self.iteration_step - 1)
-                        * self.global_batch_size,  # assumes we start from iteration_step=1
-                        end_idx=self.iteration_step * self.global_batch_size,
-                        sequence_length=self.sequence_length,
-                    )
+                    if hasattr(self.current_base_dl.dataset, "update_consumption_metrics"):
+                        self.current_base_dl.dataset.update_consumption_metrics(
+                            start_idx=(self.iteration_step - 1)
+                            * self.global_batch_size,  # assumes we start from iteration_step=1
+                            end_idx=self.iteration_step * self.global_batch_size,
+                            sequence_length=self.sequence_length,
+                        )
 
                 # Training Logs
                 # Track consumed tokens for all dataset folders in current stage
                 if hasattr(self.current_base_dl, "dataset"):
-                    consumption_stats = self.current_base_dl.dataset.get_consumption_stats()
-                    current_stage = self.metadata.data_stages[self.metadata.last_stage_idx]
+                    if hasattr(self.current_base_dl.dataset, "get_consumption_stats"):
+                        consumption_stats = self.current_base_dl.dataset.get_consumption_stats()
+                        current_stage = self.metadata.data_stages[self.metadata.last_stage_idx]
 
-                    # Update consumed tokens for all folders in the consumption stats
-                    for folder_path, stats in consumption_stats.items():
-                        current_stage.consumed_tokens_per_dataset_folder[folder_path] = stats["tokens"]
+                        # Update consumed tokens for all folders in the consumption stats
+                        for folder_path, stats in consumption_stats.items():
+                            current_stage.consumed_tokens_per_dataset_folder[folder_path] = stats["tokens"]
 
                 # Original consumption tracking
                 self.metadata.consumed_train_samples += self.global_batch_size
