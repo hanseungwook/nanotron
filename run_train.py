@@ -230,7 +230,7 @@ def get_dataloader_from_data_stage(
             consumed_train_samples=consumed_train_samples,
             dataloader_num_workers=data.num_loading_workers,
             dataloader_drop_last=True,
-            use_position_ids=isinstance(trainer.model_config, Qwen2Config),
+            use_position_ids=True,
             use_doc_masking=False,
             dataloader_pin_memory=True,
         )
