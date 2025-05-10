@@ -54,6 +54,11 @@ class DocumentAwareFlashAttention(torch.nn.Module):
             output: Attention output of shape [batch_size, seq_len, hidden_size]
             attn_probs: Optional attention probabilities if return_attn_probs is True
         """
+        # Ensure we're using proper dtype
+        # Explicitly convert to bfloat16 if not already
+        q = q.to(torch.bfloat16)
+        k = k.to(torch.bfloat16)
+        v = v.to(torch.bfloat16)
         # Check if we have document boundaries defined
         using_document_masking = position_ids is not None or document_ids is not None
 
@@ -304,7 +309,7 @@ def test_document_masking_with_position_ids():
 
     # Create our document-aware attention module
     attn = DocumentAwareFlashAttention(hidden_size, num_heads, dropout_prob=0.0)
-    attn = attn.to(device)
+    attn = attn.to(device).to(torch.bfloat16)
 
     # Initialize expected outputs
     # We'll manually compute attention for each document separately and combine
@@ -465,7 +470,7 @@ def benchmark_document_masking(seq_lengths=None):
         current_pos += seq_len
 
     # Initialize attention modules
-    flash_attn = DocumentAwareFlashAttention(hidden_size, num_heads).to(device)
+    flash_attn = DocumentAwareFlashAttention(hidden_size, num_heads).to(device).to(torch.bfloat16)
 
     # Create document mask for standard attention
     document_mask = torch.zeros((batch_size, 1, total_seq_len, total_seq_len), device=device)
