@@ -21,7 +21,19 @@ class DocumentAwareFlashAttention(torch.nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_heads = num_heads
+
+        # Flash Attention requires head_dim to be a multiple of 8
+        # Adjust head_dim to ensure it's a multiple of 8
         self.head_dim = hidden_size // num_heads
+        if self.head_dim % 8 != 0:
+            # Round up to the nearest multiple of 8
+            adjusted_head_dim = ((self.head_dim + 7) // 8) * 8
+            print(f"Warning: Adjusting head_dim from {self.head_dim} to {adjusted_head_dim} to be a multiple of 8")
+            self.head_dim = adjusted_head_dim
+            self.hidden_size = self.head_dim * num_heads
+
+        print(f"Using hidden_size={self.hidden_size}, num_heads={self.num_heads}, head_dim={self.head_dim}")
+
         self.dropout_prob = dropout_prob
         self.causal = causal
 
@@ -65,7 +77,15 @@ class DocumentAwareFlashAttention(torch.nn.Module):
         batch_size, seq_len = q.shape[0], q.shape[1]
 
         # Reshape inputs if needed
+        reshape_needed = False
+        original_shape = q.shape
+
         if q.ndim == 3:  # [batch_size, seq_len, hidden_size]
+            reshape_needed = True
+            # Ensure head_dim is a multiple of 8 for Flash Attention
+            if self.head_dim % 8 != 0:
+                raise ValueError(f"Head dimension {self.head_dim} must be a multiple of 8 for Flash Attention")
+
             q = q.view(batch_size, seq_len, self.num_heads, self.head_dim)
             k = k.view(batch_size, seq_len, self.num_heads, self.head_dim)
             v = v.view(batch_size, seq_len, self.num_heads, self.head_dim)
@@ -283,7 +303,14 @@ def test_document_masking_with_position_ids():
     batch_size = 1  # We'll use a single batch for packed sequences
     hidden_size = 128
     num_heads = 4
+
+    # Make sure head_dim is a multiple of 8 for Flash Attention
     head_dim = hidden_size // num_heads
+    if head_dim % 8 != 0:
+        # Adjust hidden_size to make head_dim a multiple of 8
+        head_dim = ((head_dim + 7) // 8) * 8
+        hidden_size = head_dim * num_heads
+        print(f"Adjusted hidden_size to {hidden_size} to make head_dim ({head_dim}) a multiple of 8")
 
     # Create packed sequences - simulating 3 documents of different lengths
     seq_lengths = [3, 5, 7]
@@ -444,7 +471,14 @@ def benchmark_document_masking(seq_lengths=None):
     batch_size = 1
     hidden_size = 768
     num_heads = 12
+
+    # Make sure head_dim is a multiple of 8 for Flash Attention
     head_dim = hidden_size // num_heads
+    if head_dim % 8 != 0:
+        # Adjust hidden_size to make head_dim a multiple of 8
+        head_dim = ((head_dim + 7) // 8) * 8
+        hidden_size = head_dim * num_heads
+        print(f"Adjusted hidden_size to {hidden_size} to make head_dim ({head_dim}) a multiple of 8")
 
     if seq_lengths is None:
         # Default: 10 sequences of varying lengths
