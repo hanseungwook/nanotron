@@ -304,6 +304,12 @@ class CausalSelfAttention(nn.Module, AttachableStore):
         rotary_pos_emb = self.rotary_embedding(position_ids=position_ids, seq_length=seq_length)
         q = self.rotary_embedding.apply_rotary_pos_emb(q, rotary_pos_emb, seq_length=seq_length)
         k = self.rotary_embedding.apply_rotary_pos_emb(k, rotary_pos_emb, seq_length=seq_length)
+        print(q.dtype, q.device)
+        print(k.dtype, k.device)
+        print(v.dtype, v.device)
+        print(position_ids.dtype, position_ids.device)
+        if cu_seqlens is not None:
+            print(cu_seqlens.dtype, cu_seqlens.device)
         attn_output = self.attention(
             q, k, v, position_ids=position_ids, seq_length=seq_length, cu_seqlens=cu_seqlens
         )
