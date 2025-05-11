@@ -195,7 +195,7 @@ class CoreAttention(nn.Module):
             start_indices = torch.where(position_ids.view(-1) == 0)[0]
             cu_seqlens = torch.cat(
                 [start_indices, torch.tensor([position_ids.numel()], dtype=torch.int32, device=start_indices.device)]
-            ).to(torch.int32)
+            ).to(dtype=position_ids.dtype)
         max_seqlen = seq_length
         softmax_scale = 1 / query_states.shape[-1] if self.is_using_mup else None
         attn_output = flash_attn_varlen_func(
@@ -485,7 +485,7 @@ class LlamaModel(nn.Module):
             start_indices = torch.where(position_ids.view(-1) == 0)[0]
             cu_seqlens = torch.cat(
                 [start_indices, torch.tensor([position_ids.numel()], dtype=torch.int32, device=start_indices.device)]
-            ).to(torch.int32)
+            ).to(dtype=position_ids.dtype)
         else:
             cu_seqlens = None
         decoder_states = {
