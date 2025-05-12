@@ -190,8 +190,8 @@ def get_dataloader_from_data_stage(
 
         with main_rank_first(trainer.parallel_context.world_pg):
             tokenizer_path = trainer.config.tokenizer.tokenizer_name_or_path
-            tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-            eos_token_id = tokenizer.eos_token_id
+            # tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+            eos_token_id = 1
             assert (
                 eos_token_id is not None or data.dataset.return_positions is False
             ), "Tokenizer must have an eos token if return_positions is True"
