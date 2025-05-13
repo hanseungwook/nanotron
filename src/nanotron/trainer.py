@@ -1178,48 +1178,49 @@ class DistributedTrainer:
 
     def pre_save_checkpoint(self) -> Path:
         # Check if eval_interval should be updated from file
-        eval_interval_file = self.config.lighteval.eval_interval_file
-        if eval_interval_file is not None and Path(eval_interval_file).exists():
-            try:
-                with open(eval_interval_file, "r") as f:
-                    new_eval_interval = int(f.read().strip())
+        if self.config.lighteval is not None:
+            eval_interval_file = self.config.lighteval.eval_interval_file
+            if eval_interval_file is not None and Path(eval_interval_file).exists():
+                try:
+                    with open(eval_interval_file, "r") as f:
+                        new_eval_interval = int(f.read().strip())
 
-                # Verify that the new interval is a multiple of checkpoint_interval
-                if new_eval_interval == self.config.lighteval.eval_interval:
-                    pass
-                elif new_eval_interval % self.config.checkpoints.checkpoint_interval == 0:
+                    # Verify that the new interval is a multiple of checkpoint_interval
+                    if new_eval_interval == self.config.lighteval.eval_interval:
+                        pass
+                    elif new_eval_interval % self.config.checkpoints.checkpoint_interval == 0:
+                        log_rank(
+                            f"Updating lighteval.eval_interval from {self.config.lighteval.eval_interval} to {new_eval_interval}",
+                            logger=logger,
+                            level=logging.INFO,
+                            rank=0,
+                        )
+                        self.config.lighteval.eval_interval = new_eval_interval
+                    else:
+                        log_rank(
+                            f"New eval_interval={new_eval_interval} must be a multiple of checkpoint_interval={self.config.checkpoints.checkpoint_interval}. Keeping current value: {self.config.lighteval.eval_interval}",
+                            logger=logger,
+                            level=logging.WARNING,
+                            rank=0,
+                        )
+                except (ValueError, IOError) as e:
                     log_rank(
-                        f"Updating lighteval.eval_interval from {self.config.lighteval.eval_interval} to {new_eval_interval}",
-                        logger=logger,
-                        level=logging.INFO,
-                        rank=0,
-                    )
-                    self.config.lighteval.eval_interval = new_eval_interval
-                else:
-                    log_rank(
-                        f"New eval_interval={new_eval_interval} must be a multiple of checkpoint_interval={self.config.checkpoints.checkpoint_interval}. Keeping current value: {self.config.lighteval.eval_interval}",
+                        f"Error reading eval_interval from file: {e}. Keeping current value: {self.config.lighteval.eval_interval}",
                         logger=logger,
                         level=logging.WARNING,
                         rank=0,
                     )
-            except (ValueError, IOError) as e:
-                log_rank(
-                    f"Error reading eval_interval from file: {e}. Keeping current value: {self.config.lighteval.eval_interval}",
-                    logger=logger,
-                    level=logging.WARNING,
-                    rank=0,
-                )
 
-        if self.s3_mover is not None:
-            self.s3_mover.distributed_wait_for_completion(self.parallel_context.world_pg)
-            if self.s3_mover.post_upload_callback_outputs is not None:
-                slurm_job_id, slurm_log = self.s3_mover.post_upload_callback_outputs
-                log_rank(
-                    f"launching eval job: job_id={slurm_job_id} log at {slurm_log} slurm_eval",
-                    logger=logger,
-                    level=logging.WARNING,
-                    rank=0,
-                )
+            if self.s3_mover is not None:
+                self.s3_mover.distributed_wait_for_completion(self.parallel_context.world_pg)
+                if self.s3_mover.post_upload_callback_outputs is not None:
+                    slurm_job_id, slurm_log = self.s3_mover.post_upload_callback_outputs
+                    log_rank(
+                        f"launching eval job: job_id={slurm_job_id} log at {slurm_log} slurm_eval",
+                        logger=logger,
+                        level=logging.WARNING,
+                        rank=0,
+                    )
 
     def post_save_checkpoint(self):
         # Upload to S3
