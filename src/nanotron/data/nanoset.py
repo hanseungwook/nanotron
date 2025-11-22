@@ -119,7 +119,7 @@ class Nanoset(torch.utils.data.Dataset):
             dict: Dictionary containing samples and tokens consumed per dataset
         """
         stats = {}
-        for dataset_idx, dataset in enumerate(self.datasets):
+        for dataset_idx, dataset in enumerate(self.datatrove_datasets):
             stats[dataset.folder_path] = {"tokens": self.consumed_tokens[dataset_idx]}
         return stats
 
