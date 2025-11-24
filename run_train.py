@@ -7,10 +7,13 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1 # important for some distributed operations
 torchrun --nproc_per_node=8 run_train.py --config-file examples/config_tiny_llama.yaml
 ```
 """
+
 import argparse
 import time
 from pprint import pformat
 from typing import Dict, Optional, cast
+
+from torch.utils.data import DataLoader
 
 import nanotron.distributed as dist
 from nanotron import logging
@@ -41,7 +44,6 @@ from nanotron.parallel.pipeline_parallel.utils import get_input_output_pp_ranks
 from nanotron.sanity_checks import sanity_check_dataloader
 from nanotron.trainer import DistributedTrainer
 from nanotron.utils import main_rank_first
-from torch.utils.data import DataLoader
 
 try:
     from huggingface_hub import __version__ as hf_hub_version
@@ -53,8 +55,86 @@ except ImportError:
 
 logger = logging.get_logger(__name__)
 
-# import lovely_tensors as lt
 
+# ---------------------------
+# Diagnostic logger (added)
+# ---------------------------
+def _log_stage_start_plan(
+    trainer: "DistributedTrainer",
+    stage: DatasetStageArgs,
+    consumed_tokens_per_dataset_folder: Dict[str, int],
+    remaining_train_steps: int,
+) -> None:
+    """
+    Pretty, localized stage-start summary. Prints folder-level offsets and the
+    expected sampling plan for the upcoming stage window.
+
+    - stage: DatasetStageArgs (has .name and .data.dataset)
+    - consumed_tokens_per_dataset_folder: dict[str,int] from previous stages
+    - remaining_train_steps: steps planned for this stage
+    """
+    # Only main process prints
+    if getattr(trainer, "parallel_context", None) is not None:
+        try:
+            is_main = trainer.is_main_process
+        except Exception:
+            is_main = True
+    else:
+        is_main = True
+    if not is_main:
+        return
+
+    gbs = int(getattr(trainer, "global_batch_size", 1))
+    seql = int(getattr(trainer, "sequence_length", 1))
+    toks_per_step = gbs * seql
+    plan_tokens = remaining_train_steps * toks_per_step
+    cur_step = int(getattr(trainer, "iteration_step", 0))
+
+    header = (
+        f"\n[diagnostic] Stage start: {getattr(stage, 'name', 'Stage')}\n"
+        f"  current_step={cur_step:,} | remaining_steps={remaining_train_steps:,}\n"
+        f"  global_batch_size={gbs} samples/step | seq_len={seql} | tokens/step={toks_per_step:,}\n"
+        f"  planned tokens this stage ≈ {plan_tokens:,}\n"
+    )
+
+    ds_args = stage.data.dataset
+    if isinstance(ds_args, NanosetDatasetsArgs):
+        folders = list(ds_args.dataset_folder)
+        weights = list(getattr(ds_args, "dataset_weights", [1.0] * len(folders)))
+        assert len(folders) == len(weights), "dataset_folder and dataset_weights must align"
+
+        total_w = float(sum(weights)) if weights else 1.0
+        if total_w == 0.0:
+            weights = [1.0 / max(1, len(weights))] * len(weights)
+            total_w = 1.0
+        norm_w = [w / total_w for w in weights]
+
+        wcol = max(12, max(len(p) for p in folders) + 2)
+        header += (
+            f"{'folder'.ljust(wcol)}  weight   start_offset_tokens  start_offset_samples"
+            f"  expected_tokens  expected_samples  note"
+        )
+        log_rank(header, logger=logger, level=logging.INFO, rank=0)
+
+        for path, w in zip(folders, norm_w):
+            start_tok = int(consumed_tokens_per_dataset_folder.get(path, 0))
+            start_smp = start_tok // seql
+            exp_tok = int(round(plan_tokens * w))
+            exp_smp = exp_tok // seql
+            note = "NEW_in_stage" if start_tok == 0 else ""
+            line = (
+                f"{path.ljust(wcol)}  {w:6.4f}  {start_tok:>19,}  {start_smp:>19,}"
+                f"  {exp_tok:>14,}  {exp_smp:>16,}  {note}"
+            )
+            log_rank(line, logger=logger, level=logging.INFO, rank=0)
+        log_rank("", logger=logger, level=logging.INFO, rank=0)
+    else:
+        # Non-Nanoset datasets (HF pretrain or SFT) — print generic summary
+        header += "  (non-Nanoset dataset; per-folder offsets not applicable)\n"
+        log_rank(header, logger=logger, level=logging.INFO, rank=0)
+
+
+# import lovely_tensors as lt
 # lt.monkey_patch()
 
 
@@ -123,14 +203,14 @@ def get_dataloader_from_data_stage(
             tokenizer.padding_side = "left"
             sequence_sep_tokens = [tokenizer.bos_token, tokenizer.eos_token, tokenizer.pad_token, tokenizer.unk_token]
             # assert bos or eos are present
-            assert (
-                tokenizer.bos_token is not None or tokenizer.eos_token is not None
-            ), f"Tokenizer must have either bos or eos token, but found none for {tokenizer_path}"
+            assert tokenizer.bos_token is not None or tokenizer.eos_token is not None, (
+                f"Tokenizer must have either bos or eos token, but found none for {tokenizer_path}"
+            )
 
             # Check that tokenizer's vocab size is smaller than the model's vocab size
-            assert (
-                tokenizer.vocab_size <= trainer.model_config.vocab_size
-            ), f"Tokenizer's vocab size ({tokenizer.vocab_size}) is larger than the model's vocab size ({trainer.model_config.vocab_size})"
+            assert tokenizer.vocab_size <= trainer.model_config.vocab_size, (
+                f"Tokenizer's vocab size ({tokenizer.vocab_size}) is larger than the model's vocab size ({trainer.model_config.vocab_size})"
+            )
 
             # Different processing for SFT vs pretraining
             if isinstance(data.dataset, SFTDatasetsArgs):
@@ -192,9 +272,9 @@ def get_dataloader_from_data_stage(
             tokenizer_path = trainer.config.tokenizer.tokenizer_name_or_path
             # tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
             eos_token_id = 1
-            assert (
-                eos_token_id is not None or data.dataset.return_positions is False
-            ), "Tokenizer must have an eos token if return_positions is True"
+            assert eos_token_id is not None or data.dataset.return_positions is False, (
+                "Tokenizer must have an eos token if return_positions is True"
+            )
             log_rank(
                 f"[Nanoset] Creating Nanoset with {len(data.dataset.dataset_folder)} dataset folders and {trainer.config.tokens.train_steps * trainer.global_batch_size} train samples",
                 logger=logger,
@@ -282,8 +362,15 @@ def get_dataloader(
             rank=0,
         )
 
-        dataloader = (
-            get_dataloader_from_data_stage(
+        if stage_idx == 0:
+            # Diagnostic print BEFORE building the stage-0 dataloader
+            _log_stage_start_plan(
+                trainer=trainer,
+                stage=stage,
+                consumed_tokens_per_dataset_folder=consumed_tokens_per_dataset_folder,
+                remaining_train_steps=num_remaining_train_steps,
+            )
+            dataloader = get_dataloader_from_data_stage(
                 trainer,
                 stage.data,
                 consumed_train_samples=consumed_train_samples,
@@ -291,16 +378,31 @@ def get_dataloader(
                 num_remaining_train_steps=num_remaining_train_steps,
                 sanity_check_dataloader_interval=sanity_check_dataloader_interval,
             )
-            if stage_idx == 0
-            else lambda stage=stage: get_dataloader_from_data_stage(
-                trainer,
-                stage.data,
+        else:
+            # Lazy init: wrap in a callable that logs diagnostics right before creating the loader
+            def _make_stage_loader(
+                stage=stage,
                 consumed_train_samples=consumed_train_samples,
                 consumed_tokens_per_dataset_folder=consumed_tokens_per_dataset_folder,
                 num_remaining_train_steps=num_remaining_train_steps,
-                sanity_check_dataloader_interval=sanity_check_dataloader_interval,
-            )
-        )
+            ):
+                _log_stage_start_plan(
+                    trainer=trainer,
+                    stage=stage,
+                    consumed_tokens_per_dataset_folder=consumed_tokens_per_dataset_folder,
+                    remaining_train_steps=num_remaining_train_steps,
+                )
+                return get_dataloader_from_data_stage(
+                    trainer,
+                    stage.data,
+                    consumed_train_samples=consumed_train_samples,
+                    consumed_tokens_per_dataset_folder=consumed_tokens_per_dataset_folder,
+                    num_remaining_train_steps=num_remaining_train_steps,
+                    sanity_check_dataloader_interval=sanity_check_dataloader_interval,
+                )
+
+            dataloader = _make_stage_loader
+
         dataloaders[stage.name] = dataloader
     return dataloaders
 
