@@ -489,6 +489,10 @@ class DistributedTrainer:
         ):
             self._ref_stream = torch.cuda.Stream(device=torch.cuda.current_device())
 
+        # Per-step reference-loss summary stats (sum/sq_sum/count/max over valid tokens on this
+        # rank), populated in training_step and reduced across DP in train_step_logs.
+        self._last_step_ref_loss_stats: Optional[Dict[str, torch.Tensor]] = None
+
         # TODO: find a better way to handle this
         parametrization_method = (
             ParametrizationMethod.SPECTRAL_MUP
@@ -906,8 +910,10 @@ class DistributedTrainer:
         # one before the trainee pipeline consumes it. The reference per-token loss is attached to
         # each microbatch dict (reference_loss / reference_logits) and read by the loss PipelineBlock.
         microbatches = [next(dataloader) for _ in range(self.n_micro_batches_per_batch)]
+        self._last_step_ref_loss_stats = None
         if self.reference_model is not None:
             ref_tp_pg = self.parallel_context.tp_pg  # ref shares the trainee TP group (phase 1: tp=1)
+            ref_stats: Optional[Dict[str, torch.Tensor]] = None
             for micro in microbatches:
                 _compute_reference_score_for_microbatch(
                     ref_model=self.reference_model,
@@ -917,6 +923,23 @@ class DistributedTrainer:
                     return_full_logits=self.config.reference_model.return_full_logits,
                     ref_stream=self._ref_stream,
                 )
+                # Accumulate cheap ref-loss summary stats over valid (label-masked) tokens.
+                rl = micro["reference_loss"].detach()
+                valid = rl.masked_select(micro["label_mask"].to(torch.bool)).float()
+                if ref_stats is None:
+                    dev = rl.device
+                    ref_stats = {
+                        "sum": torch.zeros((), device=dev, dtype=torch.float32),
+                        "sq_sum": torch.zeros((), device=dev, dtype=torch.float32),
+                        "count": torch.zeros((), device=dev, dtype=torch.float32),
+                        "max": torch.full((), float("-inf"), device=dev, dtype=torch.float32),
+                    }
+                if valid.numel() > 0:
+                    ref_stats["sum"] += valid.sum()
+                    ref_stats["sq_sum"] += (valid * valid).sum()
+                    ref_stats["count"] += valid.numel()
+                    ref_stats["max"] = torch.maximum(ref_stats["max"], valid.max())
+            self._last_step_ref_loss_stats = ref_stats
 
         nanotron_timer("train_batch_iter", "cuda").start()
         with torch.profiler.record_function("train_batch_iter"):
@@ -1167,6 +1190,26 @@ class DistributedTrainer:
                 dp_pg=self.parallel_context.dp_pg,
             )
             basic_log_entries.extend(high_loss_log_entries)
+
+        # Reference-loss telemetry (mean/std/max over valid tokens), reduced across DP. Stats are
+        # gathered in training_step's pre-loop because reference_loss is consumed by (and not
+        # returned from) the loss block, so it can't be recovered from `outputs`.
+        if self._last_step_ref_loss_stats is not None:
+            stats = self._last_step_ref_loss_stats
+            ref_sum = stats["sum"].clone()
+            ref_sq_sum = stats["sq_sum"].clone()
+            ref_count = stats["count"].clone()
+            ref_max = stats["max"].clone()
+            dist.all_reduce(ref_sum, group=self.parallel_context.dp_pg, op=dist.ReduceOp.SUM)
+            dist.all_reduce(ref_sq_sum, group=self.parallel_context.dp_pg, op=dist.ReduceOp.SUM)
+            dist.all_reduce(ref_count, group=self.parallel_context.dp_pg, op=dist.ReduceOp.SUM)
+            dist.all_reduce(ref_max, group=self.parallel_context.dp_pg, op=dist.ReduceOp.MAX)
+            count = ref_count.clamp_min(1.0)
+            ref_mean = ref_sum / count
+            ref_std = ((ref_sq_sum / count) - ref_mean * ref_mean).clamp_min(0.0).sqrt()
+            basic_log_entries.append(LogItem("high_loss_mask/ref_loss_mean", ref_mean.item(), "human_format"))
+            basic_log_entries.append(LogItem("high_loss_mask/ref_loss_std", ref_std.item(), "human_format"))
+            basic_log_entries.append(LogItem("high_loss_mask/ref_loss_max", ref_max.item(), "human_format"))
 
         # Console logging only on logger ranks
         if dist.get_rank(self.parallel_context.world_pg) in self.logger_ranks:
