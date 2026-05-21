@@ -1,5 +1,6 @@
 import datetime
 import gc
+import html
 import json
 import os
 import shutil
@@ -119,6 +120,11 @@ try:
 except ImportError:
     wandb = None
 
+HIGH_LOSS_MASK_EXAMPLE_INTERVAL = 100
+HIGH_LOSS_MASK_EXAMPLE_MAX_TOKENS = 256
+_HIGH_LOSS_MASK_TOKENIZER = None
+_HIGH_LOSS_MASK_TOKENIZER_KEY = None
+
 
 def get_size(bytes):
     """Convert bytes to human readable format"""
@@ -126,6 +132,219 @@ def get_size(bytes):
         if bytes < 1024:
             return f"{bytes:.2f}{unit}B"
         bytes /= 1024
+
+
+def _collect_high_loss_mask_logs(
+    outputs: Iterable[Dict[str, Union[torch.Tensor, TensorPointer]]],
+    dp_pg: dist.ProcessGroup,
+) -> List[LogItem]:
+    num_position_bins = 64
+    tensor_outputs = [
+        output
+        for output in outputs
+        if isinstance(output.get("high_loss_eligible_tokens"), torch.Tensor)
+        and isinstance(output.get("high_loss_masked_tokens"), torch.Tensor)
+    ]
+    if len(tensor_outputs) == 0:
+        return []
+
+    eligible_tokens = torch.stack([output["high_loss_eligible_tokens"] for output in tensor_outputs]).sum()
+    masked_tokens = torch.stack([output["high_loss_masked_tokens"] for output in tensor_outputs]).sum()
+    dist.all_reduce(eligible_tokens, group=dp_pg, op=dist.ReduceOp.SUM)
+    dist.all_reduce(masked_tokens, group=dp_pg, op=dist.ReduceOp.SUM)
+    drop_fraction = masked_tokens.float() / eligible_tokens.clamp_min(1).float()
+
+    log_entries = [
+        LogItem("high_loss_mask/masked_tokens", masked_tokens.item(), "human_format"),
+        LogItem("high_loss_mask/eligible_tokens", eligible_tokens.item(), "human_format"),
+        LogItem("high_loss_mask/drop_fraction", drop_fraction.item(), "human_format"),
+    ]
+
+    position_counts = [
+        output["high_loss_position_drop_counts"]
+        for output in tensor_outputs
+        if isinstance(output.get("high_loss_position_drop_counts"), torch.Tensor)
+    ]
+    if len(position_counts) > 0:
+        total_position_counts = torch.stack(position_counts).sum(dim=0)
+        dist.all_reduce(total_position_counts, group=dp_pg, op=dist.ReduceOp.SUM)
+        seq_len = total_position_counts.numel()
+        num_bins = max(1, min(int(num_position_bins), seq_len))
+        denominator = masked_tokens.clamp_min(1).float()
+        for bin_idx in range(num_bins):
+            start = bin_idx * seq_len // num_bins
+            end = (bin_idx + 1) * seq_len // num_bins
+            bin_fraction = total_position_counts[start:end].sum().float() / denominator
+            log_entries.append(
+                LogItem(f"high_loss_mask/position_bin_{bin_idx:02d}", bin_fraction.item(), "human_format")
+            )
+
+    return log_entries
+
+
+def _get_high_loss_mask_tokenizer(config: Config):
+    global _HIGH_LOSS_MASK_TOKENIZER, _HIGH_LOSS_MASK_TOKENIZER_KEY
+
+    tokenizer_config = getattr(config, "tokenizer", None)
+    tokenizer_name_or_path = getattr(tokenizer_config, "tokenizer_name_or_path", None)
+    if tokenizer_name_or_path is None:
+        return None
+
+    tokenizer_revision = getattr(tokenizer_config, "tokenizer_revision", None)
+    tokenizer_key = (tokenizer_name_or_path, tokenizer_revision)
+    if _HIGH_LOSS_MASK_TOKENIZER is None or _HIGH_LOSS_MASK_TOKENIZER_KEY != tokenizer_key:
+        from transformers import AutoTokenizer
+
+        tokenizer_kwargs = {}
+        if tokenizer_revision is not None:
+            tokenizer_kwargs["revision"] = tokenizer_revision
+        _HIGH_LOSS_MASK_TOKENIZER = AutoTokenizer.from_pretrained(tokenizer_name_or_path, **tokenizer_kwargs)
+        _HIGH_LOSS_MASK_TOKENIZER_KEY = tokenizer_key
+
+    return _HIGH_LOSS_MASK_TOKENIZER
+
+
+def _decode_high_loss_mask_token(tokenizer, token_id: int) -> str:
+    if hasattr(tokenizer, "decode"):
+        return tokenizer.decode([token_id], clean_up_tokenization_spaces=False)
+    if hasattr(tokenizer, "convert_ids_to_tokens"):
+        token = tokenizer.convert_ids_to_tokens(token_id)
+        if token is not None:
+            return str(token)
+    return f"<token:{token_id}>"
+
+
+def _collect_high_loss_mask_example(
+    outputs: Iterable[Dict[str, Union[torch.Tensor, TensorPointer]]],
+    tokenizer,
+) -> Optional[str]:
+    if tokenizer is None:
+        return None
+
+    example_output = None
+    for output in outputs:
+        if (
+            isinstance(output.get("high_loss_example_label_ids"), torch.Tensor)
+            and isinstance(output.get("high_loss_example_drop_mask"), torch.Tensor)
+            and isinstance(output.get("high_loss_example_valid_mask"), torch.Tensor)
+        ):
+            example_output = output
+            break
+
+    if example_output is None:
+        return None
+
+    label_ids = example_output["high_loss_example_label_ids"].detach().cpu().flatten()
+    drop_mask = example_output["high_loss_example_drop_mask"].detach().cpu().to(dtype=torch.bool).flatten()
+    valid_mask = example_output["high_loss_example_valid_mask"].detach().cpu().to(dtype=torch.bool).flatten()
+    num_tokens = min(label_ids.numel(), drop_mask.numel(), valid_mask.numel(), HIGH_LOSS_MASK_EXAMPLE_MAX_TOKENS)
+    if num_tokens == 0:
+        return None
+
+    token_spans = []
+    for token_idx in range(num_tokens):
+        token_id = int(label_ids[token_idx].item())
+        is_valid = bool(valid_mask[token_idx].item())
+        is_dropped = bool(drop_mask[token_idx].item()) and is_valid
+        token_text = html.escape(_decode_high_loss_mask_token(tokenizer, token_id))
+        state = "dropped" if is_dropped else "kept" if is_valid else "ignored"
+        css_class = "token dropped" if is_dropped else "token kept" if is_valid else "token ignored"
+        token_spans.append(
+            f'<span class="{css_class}" title="index={token_idx} id={token_id} state={state}">{token_text}</span>'
+        )
+
+    return f"""
+<style>
+.high-loss-mask-example {{
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  line-height: 1.8;
+  color: #1f2933;
+}}
+.high-loss-mask-example .legend {{
+  margin-bottom: 8px;
+  font-family: ui-sans-serif, system-ui, sans-serif;
+  font-size: 12px;
+  color: #52606d;
+}}
+.high-loss-mask-example .token {{
+  border-radius: 3px;
+  margin: 1px;
+  padding: 1px 3px;
+  white-space: pre-wrap;
+}}
+.high-loss-mask-example .dropped {{
+  background: #ffe3e3;
+  border: 1px solid #ff8787;
+  color: #9b1c1c;
+  font-weight: 700;
+}}
+.high-loss-mask-example .kept {{
+  background: #ffffff;
+  border: 1px solid #e4e7eb;
+}}
+.high-loss-mask-example .ignored {{
+  background: #f5f7fa;
+  border: 1px solid #e4e7eb;
+  color: #9aa5b1;
+  opacity: 0.75;
+}}
+</style>
+<div class="high-loss-mask-example">
+  <div class="legend">High-loss mask example: red tokens were dropped, gray tokens were ignored by the label mask.</div>
+  <div>{"".join(token_spans)}</div>
+</div>
+"""
+
+
+def load_model_config_from_json(config_path: Path):
+    """Load a nanotron model-config dataclass from a checkpoint's model_config.json.
+
+    Dispatches on the `is_{llama,qwen2,starcoder2}_config` flag that each config
+    dataclass uses for round-trip discrimination.
+    """
+    from nanotron.config.models_config import LlamaConfig, Qwen2Config, Starcoder2Config
+
+    with open(config_path) as f:
+        config_dict = json.load(f)
+
+    if config_dict.get("is_qwen2_config", False):
+        cls = Qwen2Config
+    elif config_dict.get("is_llama_config", False):
+        cls = LlamaConfig
+    elif config_dict.get("is_starcoder2_config", False):
+        cls = Starcoder2Config
+    else:
+        raise ValueError(
+            f"Cannot determine model-config class from {config_path}: "
+            "missing is_{llama,qwen2,starcoder2}_config flag"
+        )
+    import dacite
+    return dacite.from_dict(data_class=cls, data=config_dict, config=dacite.Config(strict=False))
+
+
+def call_reference_forward(ref_model, ref_cls_name: str, micro: dict) -> torch.Tensor:  # noqa: F401
+    """Architecture-agnostic forward of the reference model on a microbatch.
+
+    Returns sharded_logits from the reference's underlying Model class. Adapts the
+    input signature: Qwen2Model takes (input_ids, position_ids), Llama/Starcoder2
+    Model take (input_ids, input_mask). If the microbatch is missing the field the
+    ref needs, synthesize it cheaply from the field it does have.
+    """
+    inner = ref_model.module.model if hasattr(ref_model, "module") else ref_model.model
+    if ref_cls_name == "Qwen2Config":
+        pos = micro.get("position_ids")
+        if pos is None:
+            mask = micro["input_mask"].to(torch.long)
+            pos = (mask.cumsum(dim=1) - 1).clamp_min(0) * mask
+        return inner(input_ids=micro["input_ids"], position_ids=pos)
+    elif ref_cls_name in ("LlamaConfig", "Starcoder2Config"):
+        mask = micro.get("input_mask")
+        if mask is None:
+            # Derive a permissive mask: positions where position_ids is non-negative
+            # are valid. If the dataloader uses a different sentinel, adjust here.
+            mask = (micro["position_ids"] >= 0)
+        return inner(input_ids=micro["input_ids"], input_mask=mask)
+    raise NotImplementedError(f"Unsupported reference architecture: {ref_cls_name}")
 
 
 class DistributedTrainer:
@@ -197,6 +416,13 @@ class DistributedTrainer:
         self.unwrapped_model: NanotronModel = (
             self.model.module if isinstance(self.model, DistributedDataParallel) else self.model
         )
+
+        # Frozen reference model used for per-token loss scoring (see ReferenceModelArgs).
+        # IMPORTANT: kept strictly outside self.model so it is never seen by the optimizer,
+        # DDP wrapping, gradient sync/clipping, checkpoint save/load, or tied-param walks.
+        self.reference_model: Optional[NanotronModel] = None
+        self._reference_cls_name: Optional[str] = None
+        self._init_reference_model_if_enabled()
 
         # TODO: find a better way to handle this
         parametrization_method = (
@@ -747,6 +973,7 @@ class DistributedTrainer:
     ) -> None:
         # TODO @nouamanetazi: Megatron-LM seems to be using a barrier to report their interval time. Check if this is necessary. https://github.com/NouamaneTazi/Megatron-LM/blob/e241a96c3085b18e36c6cee1d68a8155de77b5a6/megatron/training.py#L607
         dist.barrier()
+        outputs = list(outputs)
         # End the iteration timer and get elapsed time in milliseconds
         self.iteration_timer.end()
         elapsed_time_per_iteration_ms = self.iteration_timer.elapsed * 1000
@@ -853,6 +1080,13 @@ class DistributedTrainer:
                 5, LogItem("grad_norm", self.grad_norm_unclipped.item(), "human_format")
             )  # , ".3f"))
 
+        if getattr(self.model_config, "high_loss_mask_top_percent", 0.0) > 0.0:
+            high_loss_log_entries = _collect_high_loss_mask_logs(
+                outputs=outputs,
+                dp_pg=self.parallel_context.dp_pg,
+            )
+            basic_log_entries.extend(high_loss_log_entries)
+
         # Console logging only on logger ranks
         if dist.get_rank(self.parallel_context.world_pg) in self.logger_ranks:
             assert self.loggerwriter is not None, "loggerwriter should be defined on logger ranks"
@@ -902,6 +1136,18 @@ class DistributedTrainer:
             and self.metrics_logging.log_level > 0
             and self.iteration_step % self.metrics_logging.log_detail_interval == 0
         )
+        high_loss_mask_wandb_entries = {}
+        if (
+            should_log_to_wandb
+            and getattr(self.model_config, "high_loss_mask_top_percent", 0.0) > 0.0
+            and self.iteration_step % HIGH_LOSS_MASK_EXAMPLE_INTERVAL == 0
+        ):
+            high_loss_mask_example = _collect_high_loss_mask_example(
+                outputs=outputs,
+                tokenizer=_get_high_loss_mask_tokenizer(self.config),
+            )
+            if high_loss_mask_example is not None:
+                high_loss_mask_wandb_entries["high_loss_mask/example"] = wandb.Html(high_loss_mask_example)
 
         if should_log_detailed_metrics_to_wandb:
             assert not (
@@ -942,6 +1188,7 @@ class DistributedTrainer:
             wandb.log(
                 {
                     **{log_item.tag: log_item.scalar_value for log_item in all_log_entries},
+                    **high_loss_mask_wandb_entries,
                     **tp_group_info,
                     "iteration_step": self.iteration_step,
                 },
@@ -957,6 +1204,7 @@ class DistributedTrainer:
             wandb.log(
                 {
                     **{log_item.tag: log_item.scalar_value for log_item in basic_log_entries},
+                    **high_loss_mask_wandb_entries,
                     "iteration_step": self.iteration_step,
                 },
                 step=self.iteration_step,
@@ -981,6 +1229,86 @@ class DistributedTrainer:
             log_rank("Throughput logging complete", logger=logger, level=logging.INFO, rank=0)
             if not self.config.profiler:
                 exit(0)
+
+    def _init_reference_model_if_enabled(self) -> None:
+        cfg = self.config.reference_model
+        if not cfg.enabled:
+            return
+
+        if cfg.return_full_logits and self.config.parallelism.pp > 1:
+            raise ValueError(
+                "reference_model.return_full_logits=true is not supported with pp>1 "
+                "(would require P2P of full logits [B, S, V])."
+            )
+
+        ref_cfg_path = (
+            Path(cfg.model_config_path) if cfg.model_config_path is not None
+            else Path(cfg.checkpoint_path) / MODEL_CONFIG_FILE_NAME
+        )
+        ref_model_config = load_model_config_from_json(ref_cfg_path)
+        ref_cls_name = ref_model_config.__class__.__name__
+
+        if ref_cls_name not in CONFIG_TO_MODEL_CLASS:
+            raise ValueError(
+                f"Reference model config type {ref_cls_name!r} is not registered in "
+                f"CONFIG_TO_MODEL_CLASS (supported: {list(CONFIG_TO_MODEL_CLASS)})"
+            )
+
+        # Vocab compatibility uses the trainee's *padded* vocab size since that's what label_ids spans.
+        trainee_vocab = self.model_config.vocab_size
+        if ref_model_config.vocab_size != trainee_vocab:
+            raise ValueError(
+                f"Reference vocab_size {ref_model_config.vocab_size} != trainee vocab_size "
+                f"{trainee_vocab}. Same-tokenizer is required for per-token loss alignment."
+            )
+
+        # Phase 1: only support trainee tp=pp=1 for now.
+        if self.parallel_context.tp_pg.size() == 1 and self.parallel_context.pp_pg.size() == 1:
+            ref_pc = self.parallel_context
+        else:
+            raise NotImplementedError(
+                "reference_model with trainee tp>1 or pp>1 is not yet supported (phase 1)."
+            )
+
+        log_rank(
+            f"Loading reference model from {cfg.checkpoint_path} ({ref_cls_name})",
+            logger=logger, level=logging.INFO, rank=0,
+        )
+        # _init_model overwrites self.num_params with the reference's count; preserve trainee's.
+        saved_num_params = getattr(self, "num_params", None)
+        ref_model = self._init_model(
+            model_builder=lambda: CONFIG_TO_MODEL_CLASS[ref_cls_name](
+                config=ref_model_config,
+                parallel_context=ref_pc,
+                parallel_config=self.config.parallelism,
+                random_states=self.random_states,
+            ),
+        )
+        if saved_num_params is not None:
+            self.num_params = saved_num_params
+        load_weights(
+            model=ref_model.module if hasattr(ref_model, "module") else ref_model,
+            parallel_context=ref_pc,
+            root_folder=Path(cfg.checkpoint_path),
+        )
+        ref_model.eval()
+        ref_model.requires_grad_(False)
+
+        dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
+        target_dtype = dtype_map[cfg.dtype]
+        # Cast only floating-point tensors so int buffers (e.g. position id tables) are left alone.
+        for p in ref_model.parameters():
+            p.data = p.data.to(dtype=target_dtype)
+        for b in ref_model.buffers():
+            if b.is_floating_point():
+                b.data = b.data.to(dtype=target_dtype)
+
+        self.reference_model = ref_model
+        self._reference_cls_name = ref_cls_name
+        log_rank(
+            f"Reference model ready (dtype={cfg.dtype}, params frozen, eval mode)",
+            logger=logger, level=logging.INFO, rank=0,
+        )
 
     def init_model(self) -> Union[NanotronModel, DistributedDataParallel]:
         """Initialize the model and load weights from checkpoint if needed."""

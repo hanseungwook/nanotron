@@ -1,7 +1,7 @@
 import datetime
 import glob
 import os
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import List, Optional, Type, Union
 
@@ -439,6 +439,30 @@ class GenerationArgs:
 
 
 @dataclass
+class ReferenceModelArgs:
+    """Frozen reference model used to score per-token loss for high-loss masking.
+
+    Phase 1: runs online during training. Architecture-agnostic (Qwen2/Llama/Starcoder2).
+    Compatibility: must share tokenizer/vocab with the trainee.
+    """
+    enabled: bool = False
+    checkpoint_path: Optional[str] = None
+    model_config_path: Optional[str] = None  # default: <checkpoint_path>/model_config.json
+    dtype: str = "bfloat16"  # bfloat16 | float16 | float32
+    tp: int = 1
+    return_full_logits: bool = True
+    overlap_stream: bool = True
+
+    def __post_init__(self):
+        if self.enabled:
+            assert self.checkpoint_path is not None, \
+                "reference_model.checkpoint_path is required when enabled"
+            assert self.tp == 1, "phase 1: reference_model.tp must be 1"
+            assert self.dtype in ("bfloat16", "float16", "float32"), \
+                f"reference_model.dtype must be bfloat16/float16/float32, got {self.dtype!r}"
+
+
+@dataclass
 class Config:
     """Main configuration class"""
 
@@ -455,6 +479,7 @@ class Config:
     profiler: Optional[ProfilerArgs] = None
     lighteval: Optional[LightEvalConfig] = None
     s3_upload: Optional[S3UploadArgs] = None
+    reference_model: ReferenceModelArgs = field(default_factory=ReferenceModelArgs)
 
     @classmethod
     def create_empty(cls):

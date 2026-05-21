@@ -1,3 +1,4 @@
+import math
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -856,10 +857,60 @@ def masked_mean(loss, label_mask, dtype):
     return (loss * label_mask).sum(dtype=dtype) / label_mask.sum()
 
 
+HIGH_LOSS_MASK_OUTPUT_KEYS = {
+    "high_loss_masked_tokens",
+    "high_loss_eligible_tokens",
+    "high_loss_position_drop_counts",
+    "high_loss_example_label_ids",
+    "high_loss_example_drop_mask",
+    "high_loss_example_valid_mask",
+}
+
+
+def _apply_high_loss_token_mask(
+    loss: torch.Tensor,
+    label_ids: torch.Tensor,
+    label_mask: torch.Tensor,
+    top_percent: float,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    valid_mask = label_mask.to(dtype=torch.bool)
+
+    if top_percent <= 0.0:
+        return valid_mask, {}
+
+    valid_losses = loss.detach().masked_select(valid_mask)
+    valid_count = valid_losses.numel()
+    if valid_count <= 1:
+        drop_mask = torch.zeros_like(valid_mask, dtype=torch.bool)
+    else:
+        num_drop = min(math.ceil(valid_count * top_percent / 100.0), valid_count - 1)
+        drop_mask = torch.zeros_like(valid_mask, dtype=torch.bool)
+        if num_drop > 0:
+            _, top_indices = torch.topk(valid_losses, k=num_drop, largest=True, sorted=False)
+            valid_positions = valid_mask.nonzero(as_tuple=False)
+            selected_positions = valid_positions[top_indices]
+            drop_mask[selected_positions[:, 0], selected_positions[:, 1]] = True
+
+    filtered_mask = valid_mask & ~drop_mask
+    masked_tokens = drop_mask.sum()
+    eligible_tokens = valid_mask.sum()
+
+    stats = {
+        "high_loss_masked_tokens": masked_tokens.detach().float(),
+        "high_loss_eligible_tokens": eligible_tokens.detach().float(),
+        "high_loss_position_drop_counts": drop_mask.sum(dim=0).detach().float(),
+        "high_loss_example_label_ids": label_ids[0].detach(),
+        "high_loss_example_drop_mask": drop_mask[0].detach(),
+        "high_loss_example_valid_mask": valid_mask[0].detach(),
+    }
+    return filtered_mask, stats
+
+
 class Loss(nn.Module):
-    def __init__(self, tp_pg: dist.ProcessGroup):
+    def __init__(self, tp_pg: dist.ProcessGroup, high_loss_mask_top_percent: float = 0.0):
         super().__init__()
         self.tp_pg = tp_pg
+        self.high_loss_mask_top_percent = high_loss_mask_top_percent
 
     def forward(
         self,
@@ -869,13 +920,24 @@ class Loss(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         sharded_logits = sharded_logits.view(label_ids.shape[0], label_ids.shape[1], -1)
         loss = sharded_cross_entropy(sharded_logits, label_ids.contiguous(), group=self.tp_pg, dtype=torch.float)
-        loss = masked_mean(loss, label_mask, dtype=torch.float)
-        return {"loss": loss}
+        filtered_mask, stats = _apply_high_loss_token_mask(
+            loss=loss,
+            label_ids=label_ids,
+            label_mask=label_mask,
+            top_percent=self.high_loss_mask_top_percent,
+        )
+        loss = masked_mean(loss, filtered_mask, dtype=torch.float)
+        return {"loss": loss, **stats}
 
 
 class LossWithZLoss(Loss):
-    def __init__(self, tp_pg: dist.ProcessGroup, z_loss_coefficient: float):
-        super().__init__(tp_pg)
+    def __init__(
+        self,
+        tp_pg: dist.ProcessGroup,
+        z_loss_coefficient: float,
+        high_loss_mask_top_percent: float = 0.0,
+    ):
+        super().__init__(tp_pg=tp_pg, high_loss_mask_top_percent=high_loss_mask_top_percent)
         self.z_loss_coef = z_loss_coefficient
 
     def forward(
@@ -888,9 +950,15 @@ class LossWithZLoss(Loss):
         loss, z_loss = sharded_cross_entropy(
             sharded_logits, label_ids.contiguous(), group=self.tp_pg, dtype=torch.float, z_loss_coef=self.z_loss_coef
         )
-        loss = masked_mean(loss, label_mask, dtype=torch.float)
-        z_loss = masked_mean(z_loss.detach(), label_mask, dtype=torch.float)
-        return {"loss": loss, "z_loss": z_loss}
+        filtered_mask, stats = _apply_high_loss_token_mask(
+            loss=loss,
+            label_ids=label_ids,
+            label_mask=label_mask,
+            top_percent=self.high_loss_mask_top_percent,
+        )
+        loss = masked_mean(loss, filtered_mask, dtype=torch.float)
+        z_loss = masked_mean(z_loss.detach(), filtered_mask, dtype=torch.float)
+        return {"loss": loss, "z_loss": z_loss, **stats}
 
 from nanotron.logging import LoggingCollectorMixin
 class Qwen2ForTraining(NanotronModel, LoggingCollectorMixin):
@@ -907,9 +975,16 @@ class Qwen2ForTraining(NanotronModel, LoggingCollectorMixin):
         # Choose the appropriate loss class based on config
         loss_kwargs = {
             "tp_pg": parallel_context.tp_pg,
+            "high_loss_mask_top_percent": config.high_loss_mask_top_percent,
         }
         if config.z_loss_enabled:
             loss_kwargs["z_loss_coefficient"] = config.z_loss_coefficient
+
+        loss_output_keys = {"loss"}
+        if config.high_loss_mask_top_percent > 0.0:
+            loss_output_keys |= HIGH_LOSS_MASK_OUTPUT_KEYS
+        if config.z_loss_enabled:
+            loss_output_keys.add("z_loss")
 
         self.loss = PipelineBlock(
             p2p=self.model.p2p,
@@ -920,7 +995,7 @@ class Qwen2ForTraining(NanotronModel, LoggingCollectorMixin):
                 "label_ids",
                 "label_mask",
             },
-            module_output_keys={"loss", "z_loss"} if config.z_loss_enabled else {"loss"},
+            module_output_keys=loss_output_keys,
         )
         self.parallel_context = parallel_context
         self.config = config
@@ -942,10 +1017,7 @@ class Qwen2ForTraining(NanotronModel, LoggingCollectorMixin):
             label_ids=label_ids,
             label_mask=label_mask,
         )
-        if self.config.z_loss_enabled:
-            return {"loss": loss["loss"], "z_loss": loss["z_loss"]}
-        else:
-            return {"loss": loss["loss"]}
+        return loss
 
     @torch.no_grad()
     def init_model_randomly(self, config: Config):
