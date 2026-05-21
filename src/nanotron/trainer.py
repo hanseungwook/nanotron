@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import tempfile
+from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
 from pprint import pformat
@@ -76,6 +77,7 @@ from nanotron.parallel.pipeline_parallel.engine import (
 )
 from nanotron.parallel.pipeline_parallel.utils import get_pp_rank_of
 from nanotron.parallel.tensor_parallel.enum import TensorParallelLinearMode
+from nanotron.parallel.tensor_parallel.functional import sharded_cross_entropy
 from nanotron.parallel.tensor_parallel.nn import TensorParallelRowLinear
 from nanotron.parallel.tied_parameters import (
     create_pg_for_tied_weights,
@@ -347,6 +349,60 @@ def call_reference_forward(ref_model, ref_cls_name: str, micro: dict) -> torch.T
     raise NotImplementedError(f"Unsupported reference architecture: {ref_cls_name}")
 
 
+def _check_reference_requires_masking(reference_enabled: bool, high_loss_mask_top_percent: float) -> None:
+    """Reference model is only useful when high-loss masking consumes its per-token loss.
+
+    Enabling reference_model without high_loss_mask_top_percent > 0 means the reference forward
+    runs every step and is thrown away (and the loss PipelineBlock won't even declare
+    reference_loss/reference_logits as inputs). Treat that as a config error so it fails fast.
+    """
+    if reference_enabled and not ((high_loss_mask_top_percent or 0.0) > 0.0):
+        raise ValueError(
+            "reference_model.enabled=True requires the trainee model_config to set "
+            "high_loss_mask_top_percent > 0.0 (high-loss masking is the only consumer of the "
+            "reference per-token loss). Either set high_loss_mask_top_percent > 0, or disable "
+            "reference_model."
+        )
+
+
+def _compute_reference_score_for_microbatch(
+    ref_model,
+    ref_cls_name: str,
+    ref_tp_pg,
+    micro: Dict[str, Union[torch.Tensor, TensorPointer]],
+    return_full_logits: bool,
+    ref_stream: Optional[torch.cuda.Stream] = None,
+) -> None:
+    """Mutate `micro` in-place: add `reference_loss` ([B, S] float32) and `reference_logits`.
+
+    The CE is computed via `sharded_cross_entropy` on the reference's TP group so this stays
+    correct if we ever raise ref TP>1. When `return_full_logits=False` we still need to pass a
+    tensor for `reference_logits` (PipelineBlock disallows None) -- we pass an empty float32
+    dummy that the loss block deletes (`del reference_logits`).
+
+    Phase 1 is trainee tp=pp=1, so on a DP-only setup every rank already holds its own
+    microbatch's input_ids on-device; we just run the (read-only) forward, optionally on a
+    side stream so it can overlap with trainee work.
+    """
+    ctx = torch.cuda.stream(ref_stream) if ref_stream is not None else nullcontext()
+    with torch.inference_mode(), ctx:
+        sharded_logits = call_reference_forward(ref_model, ref_cls_name, micro)
+        sharded_logits = sharded_logits.view(
+            micro["label_ids"].shape[0], micro["label_ids"].shape[1], -1
+        )
+        ref_loss = sharded_cross_entropy(
+            sharded_logits, micro["label_ids"].contiguous(), group=ref_tp_pg, dtype=torch.float
+        )  # [B, S] float32
+    if ref_stream is not None:
+        ref_stream.synchronize()  # ensure ref_loss is ready before the trainee pipeline consumes it
+    micro["reference_loss"] = ref_loss
+    if return_full_logits:
+        micro["reference_logits"] = sharded_logits.detach()
+    else:
+        # PipelineBlock disallows None -- pass a tiny dummy float32 tensor (deleted by the loss block).
+        micro["reference_logits"] = torch.empty(0, device=ref_loss.device, dtype=torch.float32)
+
+
 class DistributedTrainer:
     def __init__(
         self,
@@ -423,6 +479,19 @@ class DistributedTrainer:
         self.reference_model: Optional[NanotronModel] = None
         self._reference_cls_name: Optional[str] = None
         self._init_reference_model_if_enabled()
+
+        # Optional side CUDA stream to overlap the (read-only) reference forward with trainee work.
+        self._ref_stream: Optional[torch.cuda.Stream] = None
+        if (
+            self.reference_model is not None
+            and self.config.reference_model.overlap_stream
+            and torch.cuda.is_available()
+        ):
+            self._ref_stream = torch.cuda.Stream(device=torch.cuda.current_device())
+
+        # Per-step reference-loss summary stats (sum/sq_sum/count/max over valid tokens on this
+        # rank), populated in training_step and reduced across DP in train_step_logs.
+        self._last_step_ref_loss_stats: Optional[Dict[str, torch.Tensor]] = None
 
         # TODO: find a better way to handle this
         parametrization_method = (
@@ -837,12 +906,47 @@ class DistributedTrainer:
         if self.iteration_step < self.initial_iter_step + 5:
             log_memory(logger=logger, msg="Before train_batch_iter")
 
+        # Materialize the microbatches up-front so we can run the frozen reference forward on each
+        # one before the trainee pipeline consumes it. The reference per-token loss is attached to
+        # each microbatch dict (reference_loss / reference_logits) and read by the loss PipelineBlock.
+        microbatches = [next(dataloader) for _ in range(self.n_micro_batches_per_batch)]
+        self._last_step_ref_loss_stats = None
+        if self.reference_model is not None:
+            ref_tp_pg = self.parallel_context.tp_pg  # ref shares the trainee TP group (phase 1: tp=1)
+            ref_stats: Optional[Dict[str, torch.Tensor]] = None
+            for micro in microbatches:
+                _compute_reference_score_for_microbatch(
+                    ref_model=self.reference_model,
+                    ref_cls_name=self._reference_cls_name,
+                    ref_tp_pg=ref_tp_pg,
+                    micro=micro,
+                    return_full_logits=self.config.reference_model.return_full_logits,
+                    ref_stream=self._ref_stream,
+                )
+                # Accumulate cheap ref-loss summary stats over valid (label-masked) tokens.
+                rl = micro["reference_loss"].detach()
+                valid = rl.masked_select(micro["label_mask"].to(torch.bool)).float()
+                if ref_stats is None:
+                    dev = rl.device
+                    ref_stats = {
+                        "sum": torch.zeros((), device=dev, dtype=torch.float32),
+                        "sq_sum": torch.zeros((), device=dev, dtype=torch.float32),
+                        "count": torch.zeros((), device=dev, dtype=torch.float32),
+                        "max": torch.full((), float("-inf"), device=dev, dtype=torch.float32),
+                    }
+                if valid.numel() > 0:
+                    ref_stats["sum"] += valid.sum()
+                    ref_stats["sq_sum"] += (valid * valid).sum()
+                    ref_stats["count"] += valid.numel()
+                    ref_stats["max"] = torch.maximum(ref_stats["max"], valid.max())
+            self._last_step_ref_loss_stats = ref_stats
+
         nanotron_timer("train_batch_iter", "cuda").start()
         with torch.profiler.record_function("train_batch_iter"):
             outputs = self.pipeline_engine.train_batch_iter(
                 model=self.model,
                 pg=self.parallel_context.pp_pg,
-                batch=(next(dataloader) for _ in range(self.n_micro_batches_per_batch)),
+                batch=iter(microbatches),
                 nb_microbatches=self.n_micro_batches_per_batch,
                 grad_accumulator=self.grad_accumulator,
             )
@@ -1087,6 +1191,26 @@ class DistributedTrainer:
             )
             basic_log_entries.extend(high_loss_log_entries)
 
+        # Reference-loss telemetry (mean/std/max over valid tokens), reduced across DP. Stats are
+        # gathered in training_step's pre-loop because reference_loss is consumed by (and not
+        # returned from) the loss block, so it can't be recovered from `outputs`.
+        if self._last_step_ref_loss_stats is not None:
+            stats = self._last_step_ref_loss_stats
+            ref_sum = stats["sum"].clone()
+            ref_sq_sum = stats["sq_sum"].clone()
+            ref_count = stats["count"].clone()
+            ref_max = stats["max"].clone()
+            dist.all_reduce(ref_sum, group=self.parallel_context.dp_pg, op=dist.ReduceOp.SUM)
+            dist.all_reduce(ref_sq_sum, group=self.parallel_context.dp_pg, op=dist.ReduceOp.SUM)
+            dist.all_reduce(ref_count, group=self.parallel_context.dp_pg, op=dist.ReduceOp.SUM)
+            dist.all_reduce(ref_max, group=self.parallel_context.dp_pg, op=dist.ReduceOp.MAX)
+            count = ref_count.clamp_min(1.0)
+            ref_mean = ref_sum / count
+            ref_std = ((ref_sq_sum / count) - ref_mean * ref_mean).clamp_min(0.0).sqrt()
+            basic_log_entries.append(LogItem("high_loss_mask/ref_loss_mean", ref_mean.item(), "human_format"))
+            basic_log_entries.append(LogItem("high_loss_mask/ref_loss_std", ref_std.item(), "human_format"))
+            basic_log_entries.append(LogItem("high_loss_mask/ref_loss_max", ref_max.item(), "human_format"))
+
         # Console logging only on logger ranks
         if dist.get_rank(self.parallel_context.world_pg) in self.logger_ranks:
             assert self.loggerwriter is not None, "loggerwriter should be defined on logger ranks"
@@ -1234,6 +1358,11 @@ class DistributedTrainer:
         cfg = self.config.reference_model
         if not cfg.enabled:
             return
+
+        _check_reference_requires_masking(
+            reference_enabled=True,
+            high_loss_mask_top_percent=getattr(self.model_config, "high_loss_mask_top_percent", 0.0),
+        )
 
         if cfg.return_full_logits and self.config.parallelism.pp > 1:
             raise ValueError(
