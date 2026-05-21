@@ -147,6 +147,7 @@ class Qwen2Config:
     sliding_window_size: Optional[int] = None
     z_loss_enabled: bool = False  # Z-loss regularization https://www.jmlr.org/papers/volume24/22-1144/22-1144.pdf
     z_loss_coefficient: float = 0.0001  # Default from the paper (10^-4)
+    high_loss_mask_top_percent: float = 0.0
     no_rope_layer: Optional[
         int
     ] = None  # Skip rope every no_rope_layer layers (see https://arxiv.org/abs/2501.18795 https://arxiv.org/abs/2305.19466 and Llama4)
@@ -200,6 +201,9 @@ class Qwen2Config:
             assert (
                 self.num_hidden_layers % self.no_rope_layer == 0
             ), "no_rope_layer must be a multiple of num_hidden_layers"
+        assert (
+            0.0 <= self.high_loss_mask_top_percent < 100.0
+        ), "high_loss_mask_top_percent must be in [0, 100)"
 
         if self._attn_implementation == "llama3_ring_attention":
             assert self.ring_attn_heads_k_stride is not None, "ring_attn_heads_k_stride must be specified for llama3 ring attention"
