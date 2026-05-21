@@ -872,21 +872,23 @@ def _apply_high_loss_token_mask(
     label_ids: torch.Tensor,
     label_mask: torch.Tensor,
     top_percent: float,
+    reference_loss: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     valid_mask = label_mask.to(dtype=torch.bool)
 
     if top_percent <= 0.0:
         return valid_mask, {}
 
-    valid_losses = loss.detach().masked_select(valid_mask)
-    valid_count = valid_losses.numel()
+    score = reference_loss if reference_loss is not None else loss
+    valid_scores = score.detach().masked_select(valid_mask)
+    valid_count = valid_scores.numel()
     if valid_count <= 1:
         drop_mask = torch.zeros_like(valid_mask, dtype=torch.bool)
     else:
         num_drop = min(math.ceil(valid_count * top_percent / 100.0), valid_count - 1)
         drop_mask = torch.zeros_like(valid_mask, dtype=torch.bool)
         if num_drop > 0:
-            _, top_indices = torch.topk(valid_losses, k=num_drop, largest=True, sorted=False)
+            _, top_indices = torch.topk(valid_scores, k=num_drop, largest=True, sorted=False)
             valid_positions = valid_mask.nonzero(as_tuple=False)
             selected_positions = valid_positions[top_indices]
             drop_mask[selected_positions[:, 0], selected_positions[:, 1]] = True
@@ -917,7 +919,10 @@ class Loss(nn.Module):
         sharded_logits: torch.Tensor,  # [batch_size*seq_length, logits]
         label_ids: torch.Tensor,  # [batch_size, seq_length]
         label_mask: torch.Tensor,  # [batch_size, seq_length]
+        reference_loss: Optional[torch.Tensor] = None,  # [batch_size, seq_length] from frozen ref
+        reference_logits: Optional[torch.Tensor] = None,  # [batch_size, seq_length, vocab] from frozen ref (unused here)
     ) -> Dict[str, torch.Tensor]:
+        del reference_logits  # reserved for future scoring strategies; ignored when reference_loss is provided
         sharded_logits = sharded_logits.view(label_ids.shape[0], label_ids.shape[1], -1)
         loss = sharded_cross_entropy(sharded_logits, label_ids.contiguous(), group=self.tp_pg, dtype=torch.float)
         filtered_mask, stats = _apply_high_loss_token_mask(
@@ -925,6 +930,7 @@ class Loss(nn.Module):
             label_ids=label_ids,
             label_mask=label_mask,
             top_percent=self.high_loss_mask_top_percent,
+            reference_loss=reference_loss,
         )
         loss = masked_mean(loss, filtered_mask, dtype=torch.float)
         return {"loss": loss, **stats}
@@ -945,7 +951,10 @@ class LossWithZLoss(Loss):
         sharded_logits: torch.Tensor,  # [batch_size*seq_length, logits]
         label_ids: torch.Tensor,  # [batch_size, seq_length]
         label_mask: torch.Tensor,  # [batch_size, seq_length]
+        reference_loss: Optional[torch.Tensor] = None,  # [batch_size, seq_length] from frozen ref
+        reference_logits: Optional[torch.Tensor] = None,  # [batch_size, seq_length, vocab] from frozen ref (unused here)
     ) -> Dict[str, torch.Tensor]:
+        del reference_logits  # reserved for future scoring strategies; ignored when reference_loss is provided
         sharded_logits = sharded_logits.view(label_ids.shape[0], label_ids.shape[1], -1)
         loss, z_loss = sharded_cross_entropy(
             sharded_logits, label_ids.contiguous(), group=self.tp_pg, dtype=torch.float, z_loss_coef=self.z_loss_coef
@@ -955,6 +964,7 @@ class LossWithZLoss(Loss):
             label_ids=label_ids,
             label_mask=label_mask,
             top_percent=self.high_loss_mask_top_percent,
+            reference_loss=reference_loss,
         )
         loss = masked_mean(loss, filtered_mask, dtype=torch.float)
         z_loss = masked_mean(z_loss.detach(), filtered_mask, dtype=torch.float)
@@ -986,15 +996,19 @@ class Qwen2ForTraining(NanotronModel, LoggingCollectorMixin):
         if config.z_loss_enabled:
             loss_output_keys.add("z_loss")
 
+        loss_input_keys = {
+            "sharded_logits",
+            "label_ids",
+            "label_mask",
+        }
+        if config.high_loss_mask_top_percent > 0.0:
+            loss_input_keys |= {"reference_loss", "reference_logits"}
+
         self.loss = PipelineBlock(
             p2p=self.model.p2p,
             module_builder=LossWithZLoss if config.z_loss_enabled else Loss,
             module_kwargs=loss_kwargs,
-            module_input_keys={
-                "sharded_logits",
-                "label_ids",
-                "label_mask",
-            },
+            module_input_keys=loss_input_keys,
             module_output_keys=loss_output_keys,
         )
         self.parallel_context = parallel_context
@@ -1007,16 +1021,27 @@ class Qwen2ForTraining(NanotronModel, LoggingCollectorMixin):
         position_ids: Union[torch.Tensor, TensorPointer],
         label_ids: Union[torch.Tensor, TensorPointer],
         label_mask: Union[torch.Tensor, TensorPointer],
+        reference_loss: Optional[Union[torch.Tensor, TensorPointer]] = None,
+        reference_logits: Optional[Union[torch.Tensor, TensorPointer]] = None,
     ) -> Dict[str, Union[torch.Tensor, TensorPointer]]:
         sharded_logits = self.model(
             input_ids=input_ids,
             position_ids=position_ids,
         )
-        loss = self.loss(
-            sharded_logits=sharded_logits,
-            label_ids=label_ids,
-            label_mask=label_mask,
-        )
+        if self.config.high_loss_mask_top_percent > 0.0:
+            loss = self.loss(
+                sharded_logits=sharded_logits,
+                label_ids=label_ids,
+                label_mask=label_mask,
+                reference_loss=reference_loss,
+                reference_logits=reference_logits,
+            )
+        else:
+            loss = self.loss(
+                sharded_logits=sharded_logits,
+                label_ids=label_ids,
+                label_mask=label_mask,
+            )
         return loss
 
     @torch.no_grad()
