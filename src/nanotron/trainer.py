@@ -296,6 +296,57 @@ def _collect_high_loss_mask_example(
 """
 
 
+def load_model_config_from_json(config_path: Path):
+    """Load a nanotron model-config dataclass from a checkpoint's model_config.json.
+
+    Dispatches on the `is_{llama,qwen2,starcoder2}_config` flag that each config
+    dataclass uses for round-trip discrimination.
+    """
+    from nanotron.config.models_config import LlamaConfig, Qwen2Config, Starcoder2Config
+
+    with open(config_path) as f:
+        config_dict = json.load(f)
+
+    if config_dict.get("is_qwen2_config", False):
+        cls = Qwen2Config
+    elif config_dict.get("is_llama_config", False):
+        cls = LlamaConfig
+    elif config_dict.get("is_starcoder2_config", False):
+        cls = Starcoder2Config
+    else:
+        raise ValueError(
+            f"Cannot determine model-config class from {config_path}: "
+            "missing is_{llama,qwen2,starcoder2}_config flag"
+        )
+    import dacite
+    return dacite.from_dict(data_class=cls, data=config_dict, config=dacite.Config(strict=False))
+
+
+def call_reference_forward(ref_model, ref_cls_name: str, micro: dict) -> torch.Tensor:  # noqa: F401
+    """Architecture-agnostic forward of the reference model on a microbatch.
+
+    Returns sharded_logits from the reference's underlying Model class. Adapts the
+    input signature: Qwen2Model takes (input_ids, position_ids), Llama/Starcoder2
+    Model take (input_ids, input_mask). If the microbatch is missing the field the
+    ref needs, synthesize it cheaply from the field it does have.
+    """
+    inner = ref_model.module.model if hasattr(ref_model, "module") else ref_model.model
+    if ref_cls_name == "Qwen2Config":
+        pos = micro.get("position_ids")
+        if pos is None:
+            mask = micro["input_mask"].to(torch.long)
+            pos = (mask.cumsum(dim=1) - 1).clamp_min(0) * mask
+        return inner(input_ids=micro["input_ids"], position_ids=pos)
+    elif ref_cls_name in ("LlamaConfig", "Starcoder2Config"):
+        mask = micro.get("input_mask")
+        if mask is None:
+            # Derive a permissive mask: positions where position_ids is non-negative
+            # are valid. If the dataloader uses a different sentinel, adjust here.
+            mask = (micro["position_ids"] >= 0)
+        return inner(input_ids=micro["input_ids"], input_mask=mask)
+    raise NotImplementedError(f"Unsupported reference architecture: {ref_cls_name}")
+
+
 class DistributedTrainer:
     def __init__(
         self,
@@ -365,6 +416,13 @@ class DistributedTrainer:
         self.unwrapped_model: NanotronModel = (
             self.model.module if isinstance(self.model, DistributedDataParallel) else self.model
         )
+
+        # Frozen reference model used for per-token loss scoring (see ReferenceModelArgs).
+        # IMPORTANT: kept strictly outside self.model so it is never seen by the optimizer,
+        # DDP wrapping, gradient sync/clipping, checkpoint save/load, or tied-param walks.
+        self.reference_model: Optional[NanotronModel] = None
+        self._reference_cls_name: Optional[str] = None
+        self._init_reference_model_if_enabled()
 
         # TODO: find a better way to handle this
         parametrization_method = (
@@ -1171,6 +1229,86 @@ class DistributedTrainer:
             log_rank("Throughput logging complete", logger=logger, level=logging.INFO, rank=0)
             if not self.config.profiler:
                 exit(0)
+
+    def _init_reference_model_if_enabled(self) -> None:
+        cfg = self.config.reference_model
+        if not cfg.enabled:
+            return
+
+        if cfg.return_full_logits and self.config.parallelism.pp > 1:
+            raise ValueError(
+                "reference_model.return_full_logits=true is not supported with pp>1 "
+                "(would require P2P of full logits [B, S, V])."
+            )
+
+        ref_cfg_path = (
+            Path(cfg.model_config_path) if cfg.model_config_path is not None
+            else Path(cfg.checkpoint_path) / MODEL_CONFIG_FILE_NAME
+        )
+        ref_model_config = load_model_config_from_json(ref_cfg_path)
+        ref_cls_name = ref_model_config.__class__.__name__
+
+        if ref_cls_name not in CONFIG_TO_MODEL_CLASS:
+            raise ValueError(
+                f"Reference model config type {ref_cls_name!r} is not registered in "
+                f"CONFIG_TO_MODEL_CLASS (supported: {list(CONFIG_TO_MODEL_CLASS)})"
+            )
+
+        # Vocab compatibility uses the trainee's *padded* vocab size since that's what label_ids spans.
+        trainee_vocab = self.model_config.vocab_size
+        if ref_model_config.vocab_size != trainee_vocab:
+            raise ValueError(
+                f"Reference vocab_size {ref_model_config.vocab_size} != trainee vocab_size "
+                f"{trainee_vocab}. Same-tokenizer is required for per-token loss alignment."
+            )
+
+        # Phase 1: only support trainee tp=pp=1 for now.
+        if self.parallel_context.tp_pg.size() == 1 and self.parallel_context.pp_pg.size() == 1:
+            ref_pc = self.parallel_context
+        else:
+            raise NotImplementedError(
+                "reference_model with trainee tp>1 or pp>1 is not yet supported (phase 1)."
+            )
+
+        log_rank(
+            f"Loading reference model from {cfg.checkpoint_path} ({ref_cls_name})",
+            logger=logger, level=logging.INFO, rank=0,
+        )
+        # _init_model overwrites self.num_params with the reference's count; preserve trainee's.
+        saved_num_params = getattr(self, "num_params", None)
+        ref_model = self._init_model(
+            model_builder=lambda: CONFIG_TO_MODEL_CLASS[ref_cls_name](
+                config=ref_model_config,
+                parallel_context=ref_pc,
+                parallel_config=self.config.parallelism,
+                random_states=self.random_states,
+            ),
+        )
+        if saved_num_params is not None:
+            self.num_params = saved_num_params
+        load_weights(
+            model=ref_model.module if hasattr(ref_model, "module") else ref_model,
+            parallel_context=ref_pc,
+            root_folder=Path(cfg.checkpoint_path),
+        )
+        ref_model.eval()
+        ref_model.requires_grad_(False)
+
+        dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
+        target_dtype = dtype_map[cfg.dtype]
+        # Cast only floating-point tensors so int buffers (e.g. position id tables) are left alone.
+        for p in ref_model.parameters():
+            p.data = p.data.to(dtype=target_dtype)
+        for b in ref_model.buffers():
+            if b.is_floating_point():
+                b.data = b.data.to(dtype=target_dtype)
+
+        self.reference_model = ref_model
+        self._reference_cls_name = ref_cls_name
+        log_rank(
+            f"Reference model ready (dtype={cfg.dtype}, params frozen, eval mode)",
+            logger=logger, level=logging.INFO, rank=0,
+        )
 
     def init_model(self) -> Union[NanotronModel, DistributedDataParallel]:
         """Initialize the model and load weights from checkpoint if needed."""
