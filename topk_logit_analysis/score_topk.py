@@ -12,8 +12,10 @@ The script handles two backends:
   - `nanotron`: checkpoint folder containing `config.yaml` plus `model/`. Uses
     nanotron's `CONFIG_TO_MODEL_CLASS` + `load_weights`, so it works for any
     architecture the trainer already supports (Qwen2 / Llama / Starcoder2).
-    Forward runs on the full packed sequence with `_use_doc_masking=True`,
-    matching the training-time attention regime.
+    Qwen2 forwards with packed `position_ids`, preserving doc-boundary
+    attention masking. Llama and Starcoder2 forwards use their existing
+    `input_mask` interface, which does not encode packed-document boundaries
+    in this checkout.
 
   - `hf`: a HuggingFace model directory or hub id. Loaded with transformers
     `AutoModelForCausalLM`. To match the trainee's doc-masked attention regime
@@ -212,16 +214,22 @@ def load_nanotron(checkpoint: Path, dtype: torch.dtype):
 
     vocab_size = int(model_config.vocab_size)
     max_pos = int(getattr(model_config, "max_position_embeddings", 2048))
-    return model, parallel_context, tokenizer_path, vocab_size, max_pos
+    return model, parallel_context, tokenizer_path, vocab_size, max_pos, model_config_cls
 
 
 def forward_nanotron(
     model,
+    model_config_cls: str,
     input_ids: torch.Tensor,
     positions: torch.Tensor,
 ) -> torch.Tensor:
     """Return logits [B, T, V]. TP=1 so sharded_logits are already full logits."""
-    sharded_logits = model.model(input_ids=input_ids, position_ids=positions)
+    if model_config_cls == "Qwen2Config":
+        sharded_logits = model.model(input_ids=input_ids, position_ids=positions)
+    elif model_config_cls in {"LlamaConfig", "Starcoder2Config"}:
+        sharded_logits = model.model(input_ids=input_ids, input_mask=torch.ones_like(positions, dtype=torch.bool))
+    else:
+        raise ValueError(f"Unsupported nanotron model config {model_config_cls}")
     if sharded_logits.dim() == 2:
         sharded_logits = sharded_logits.view(input_ids.shape[0], input_ids.shape[1], -1)
     return sharded_logits
@@ -539,12 +547,13 @@ def main():
     assert_vocab_compatible(early_vocab, records)
 
     if backend == "nanotron":
-        model, _parallel_context, tokenizer_path, vocab_size, max_pos = load_nanotron(
+        model, _parallel_context, tokenizer_path, vocab_size, max_pos, model_config_cls = load_nanotron(
             Path(args.checkpoint), dtype
         )
         print(
             f"[nanotron] loaded {args.checkpoint}, "
-            f"tokenizer={tokenizer_path}, vocab_size={vocab_size}, max_pos={max_pos}",
+            f"tokenizer={tokenizer_path}, vocab_size={vocab_size}, max_pos={max_pos}, "
+            f"config={model_config_cls}",
             flush=True,
         )
     elif backend == "hf":
@@ -580,7 +589,7 @@ def main():
 
         if backend == "nanotron":
             with torch.no_grad():
-                logits = forward_nanotron(model, model_input, model_positions)
+                logits = forward_nanotron(model, model_config_cls, model_input, model_positions)
             (
                 per_token_target_rank,
                 per_token_top1_id,

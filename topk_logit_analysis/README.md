@@ -87,7 +87,10 @@ topk_logit_analysis/
 
 `backend=nanotron` expects a directory containing `config.yaml` and `model/`.
 It uses the same Nanotron loading/forward pattern as the loss-mask analysis
-template and assumes TP=PP=DP=1.
+template and assumes TP=PP=DP=1. Qwen2 checkpoints are forwarded with packed
+`position_ids`, preserving doc-boundary attention masking. Llama and Starcoder2
+checkpoints are forwarded through their `input_mask` interface, which does not
+represent packed-document boundaries in this checkout.
 
 `backend=hf` expects a local Hugging Face model directory or Hub id and uses
 `AutoModelForCausalLM.from_pretrained(..., trust_remote_code=True)`. Packed
