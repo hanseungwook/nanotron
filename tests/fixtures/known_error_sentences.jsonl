@@ -1,0 +1,50 @@
+{"id":"err_001","domain":"geography","sentence":"The capital city of France is Seoul.","error_span":"Seoul","correction":"Paris","error_type":"wrong_capital"}
+{"id":"err_002","domain":"geography","sentence":"Brazil is the largest country in Africa.","error_span":"Africa","correction":"South America","error_type":"wrong_continent"}
+{"id":"err_003","domain":"geography","sentence":"Mount Everest is located in the Andes.","error_span":"Andes","correction":"Himalayas","error_type":"wrong_mountain_range"}
+{"id":"err_004","domain":"geography","sentence":"The Nile River primarily flows through Australia.","error_span":"Australia","correction":"Africa","error_type":"wrong_region"}
+{"id":"err_005","domain":"geography","sentence":"Tokyo is the capital city of Canada.","error_span":"Tokyo","correction":"Ottawa","error_type":"wrong_capital"}
+{"id":"err_006","domain":"geography","sentence":"The Sahara is a rainforest in northern Europe.","error_span":"rainforest in northern Europe","correction":"desert in northern Africa","error_type":"wrong_biome_and_region"}
+{"id":"err_007","domain":"geography","sentence":"The Pacific Ocean is the smallest ocean on Earth.","error_span":"smallest","correction":"largest","error_type":"wrong_superlative"}
+{"id":"err_008","domain":"geography","sentence":"Iceland is a landlocked country in central Asia.","error_span":"landlocked country in central Asia","correction":"island country in the North Atlantic","error_type":"wrong_location"}
+{"id":"err_009","domain":"math","sentence":"Two plus two equals eight.","error_span":"eight","correction":"four","error_type":"wrong_arithmetic"}
+{"id":"err_010","domain":"math","sentence":"The square root of 81 is 7.","error_span":"7","correction":"9","error_type":"wrong_arithmetic"}
+{"id":"err_011","domain":"math","sentence":"A triangle has four sides.","error_span":"four","correction":"three","error_type":"wrong_geometry"}
+{"id":"err_012","domain":"math","sentence":"The value of pi is exactly 3.","error_span":"exactly 3","correction":"approximately 3.14159","error_type":"wrong_constant"}
+{"id":"err_013","domain":"math","sentence":"Ten divided by two equals three.","error_span":"three","correction":"five","error_type":"wrong_arithmetic"}
+{"id":"err_014","domain":"math","sentence":"A right angle measures 45 degrees.","error_span":"45","correction":"90","error_type":"wrong_measurement"}
+{"id":"err_015","domain":"math","sentence":"The derivative of x squared is x.","error_span":"x","correction":"2x","error_type":"wrong_calculus"}
+{"id":"err_016","domain":"math","sentence":"A prime number is always divisible by 3.","error_span":"always divisible by 3","correction":"divisible only by 1 and itself","error_type":"wrong_definition"}
+{"id":"err_017","domain":"science","sentence":"Water boils at 50 degrees Celsius at sea level.","error_span":"50 degrees Celsius","correction":"100 degrees Celsius","error_type":"wrong_physical_property"}
+{"id":"err_018","domain":"science","sentence":"The Earth orbits the Moon.","error_span":"Earth orbits the Moon","correction":"Moon orbits the Earth","error_type":"reversed_relation"}
+{"id":"err_019","domain":"science","sentence":"Humans breathe in carbon dioxide and exhale oxygen.","error_span":"breathe in carbon dioxide and exhale oxygen","correction":"breathe in oxygen and exhale carbon dioxide","error_type":"reversed_process"}
+{"id":"err_020","domain":"science","sentence":"The chemical symbol for gold is Ag.","error_span":"Ag","correction":"Au","error_type":"wrong_symbol"}
+{"id":"err_021","domain":"science","sentence":"Photosynthesis primarily converts sunlight into sound energy.","error_span":"sound energy","correction":"chemical energy","error_type":"wrong_process_output"}
+{"id":"err_022","domain":"science","sentence":"Mars is known as the Blue Planet.","error_span":"Blue Planet","correction":"Red Planet","error_type":"wrong_nickname"}
+{"id":"err_023","domain":"science","sentence":"Electrons have a positive electric charge.","error_span":"positive","correction":"negative","error_type":"wrong_property"}
+{"id":"err_024","domain":"science","sentence":"DNA stands for dynamic nitrogen acid.","error_span":"dynamic nitrogen acid","correction":"deoxyribonucleic acid","error_type":"wrong_expansion"}
+{"id":"err_025","domain":"science","sentence":"The speed of light in vacuum is about 300 kilometers per second.","error_span":"300 kilometers per second","correction":"300,000 kilometers per second","error_type":"wrong_magnitude"}
+{"id":"err_026","domain":"science","sentence":"Plants absorb most of their energy from moonlight.","error_span":"moonlight","correction":"sunlight","error_type":"wrong_energy_source"}
+{"id":"err_027","domain":"history","sentence":"The Roman Empire was founded by George Washington.","error_span":"George Washington","correction":"Augustus","error_type":"wrong_person"}
+{"id":"err_028","domain":"history","sentence":"The United States declared independence in 1914.","error_span":"1914","correction":"1776","error_type":"wrong_date"}
+{"id":"err_029","domain":"history","sentence":"The printing press is commonly credited to Isaac Newton.","error_span":"Isaac Newton","correction":"Johannes Gutenberg","error_type":"wrong_person"}
+{"id":"err_030","domain":"history","sentence":"World War II ended in 1865.","error_span":"1865","correction":"1945","error_type":"wrong_date"}
+{"id":"err_031","domain":"history","sentence":"The ancient pyramids of Giza were built in Mexico.","error_span":"Mexico","correction":"Egypt","error_type":"wrong_location"}
+{"id":"err_032","domain":"history","sentence":"The Magna Carta was signed in 2001.","error_span":"2001","correction":"1215","error_type":"wrong_date"}
+{"id":"err_033","domain":"history","sentence":"The first successful airplane flight by the Wright brothers happened on the Moon.","error_span":"on the Moon","correction":"at Kitty Hawk, North Carolina","error_type":"wrong_location"}
+{"id":"err_034","domain":"computing_web","sentence":"HTTP stands for HyperText Transfer Planet.","error_span":"HyperText Transfer Planet","correction":"HyperText Transfer Protocol","error_type":"wrong_expansion"}
+{"id":"err_035","domain":"computing_web","sentence":"A web browser renders HTML using a toaster engine.","error_span":"toaster engine","correction":"browser engine","error_type":"wrong_technical_term"}
+{"id":"err_036","domain":"computing_web","sentence":"Python was created by Linus Torvalds.","error_span":"Linus Torvalds","correction":"Guido van Rossum","error_type":"wrong_creator"}
+{"id":"err_037","domain":"computing_web","sentence":"Git is a database language used only for styling web pages.","error_span":"database language used only for styling web pages","correction":"version control system","error_type":"wrong_definition"}
+{"id":"err_038","domain":"computing_web","sentence":"DNS translates domain names into cooking recipes.","error_span":"cooking recipes","correction":"IP addresses","error_type":"wrong_function"}
+{"id":"err_039","domain":"computing_web","sentence":"JavaScript code can only run inside spreadsheet cells.","error_span":"only run inside spreadsheet cells","correction":"run in browsers and many server environments","error_type":"wrong_platform"}
+{"id":"err_040","domain":"computing_web","sentence":"An IP address identifies the color palette of a website.","error_span":"color palette of a website","correction":"network location of a device or host","error_type":"wrong_definition"}
+{"id":"err_041","domain":"medicine_biology","sentence":"The human heart normally pumps blood with the lungs as its only chamber.","error_span":"lungs as its only chamber","correction":"four chambers","error_type":"wrong_anatomy"}
+{"id":"err_042","domain":"medicine_biology","sentence":"Insulin is produced by the liver to digest bones.","error_span":"liver to digest bones","correction":"pancreas to help regulate blood sugar","error_type":"wrong_function"}
+{"id":"err_043","domain":"medicine_biology","sentence":"Red blood cells primarily carry messages between neurons.","error_span":"messages between neurons","correction":"oxygen through the bloodstream","error_type":"wrong_function"}
+{"id":"err_044","domain":"medicine_biology","sentence":"Antibiotics are designed to treat viral infections like the common cold.","error_span":"viral infections like the common cold","correction":"bacterial infections","error_type":"wrong_treatment_target"}
+{"id":"err_045","domain":"medicine_biology","sentence":"The adult human skeleton contains about 20 bones.","error_span":"20","correction":"206","error_type":"wrong_quantity"}
+{"id":"err_046","domain":"literature_arts","sentence":"Herman Melville wrote the novel Moby-Duck.","error_span":"Moby-Duck","correction":"Moby-Dick","error_type":"wrong_title"}
+{"id":"err_047","domain":"literature_arts","sentence":"The Mona Lisa was painted by Vincent van Gogh.","error_span":"Vincent van Gogh","correction":"Leonardo da Vinci","error_type":"wrong_artist"}
+{"id":"err_048","domain":"literature_arts","sentence":"Beethoven is best known as a French impressionist painter.","error_span":"French impressionist painter","correction":"German composer","error_type":"wrong_role"}
+{"id":"err_049","domain":"sports","sentence":"In standard soccer, a team fields twenty goalkeepers at once.","error_span":"twenty goalkeepers","correction":"one goalkeeper","error_type":"wrong_rule"}
+{"id":"err_050","domain":"sports","sentence":"A standard basketball game begins with a coin toss at home plate.","error_span":"coin toss at home plate","correction":"jump ball at center court","error_type":"wrong_rule"}
