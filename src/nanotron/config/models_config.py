@@ -147,6 +147,13 @@ class Qwen2Config:
     sliding_window_size: Optional[int] = None
     z_loss_enabled: bool = False  # Z-loss regularization https://www.jmlr.org/papers/volume24/22-1144/22-1144.pdf
     z_loss_coefficient: float = 0.0001  # Default from the paper (10^-4)
+    # Top-K unlikely-token loss masking: mask out (exclude from the loss) any target token
+    # that is NOT within the model's own top-K predictions for that position, i.e. whose
+    # self-scored rank (rank = 1 + count(logit > target_logit)) is greater than K.
+    # Named to avoid colliding with generation `top_k` / MoE `top_k`.
+    topk_loss_mask_enabled: bool = False  # Enable top-K unlikely-token loss masking
+    topk_loss_mask_k: Optional[int] = None  # Keep tokens whose self-scored rank is <= K
+    topk_loss_mask_max_drop_percent: float = 100.0  # Cap on % of active tokens that may be masked per batch
     no_rope_layer: Optional[
         int
     ] = None  # Skip rope every no_rope_layer layers (see https://arxiv.org/abs/2501.18795 https://arxiv.org/abs/2305.19466 and Llama4)
@@ -205,6 +212,20 @@ class Qwen2Config:
             assert self.ring_attn_heads_k_stride is not None, "ring_attn_heads_k_stride must be specified for llama3 ring attention"
         else:
             assert self.ring_attn_heads_k_stride is None, f"ring_attn_heads_k_stride must be None for non-llama3 ring attention, got attn_implementation={self._attn_implementation}"
+
+        if self.topk_loss_mask_enabled:
+            assert (
+                self.topk_loss_mask_k is not None
+            ), "topk_loss_mask_k must be set when topk_loss_mask_enabled is True"
+            assert (
+                self.topk_loss_mask_k > 0
+            ), f"topk_loss_mask_k must be > 0, got {self.topk_loss_mask_k}"
+            assert (
+                self.topk_loss_mask_k < self.vocab_size
+            ), f"topk_loss_mask_k ({self.topk_loss_mask_k}) must be < vocab_size ({self.vocab_size})"
+            assert (
+                0.0 <= self.topk_loss_mask_max_drop_percent <= 100.0
+            ), f"topk_loss_mask_max_drop_percent must be in [0, 100], got {self.topk_loss_mask_max_drop_percent}"
 
     @property
     def is_using_mup(self) -> bool:
