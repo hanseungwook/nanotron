@@ -234,6 +234,116 @@ def sharded_cross_entropy(
         return _ShardedCrossEntropy.apply(sharded_logits, target, group)
 
 
+@torch.no_grad()
+def compute_target_token_ranks(
+    sharded_logits,  # (..., local_vocab_size)
+    target,  # (...)
+    group: Optional[dist.ProcessGroup] = None,
+):
+    """Compute the rank of each target token under the model's own logits.
+
+    The rank convention is ``rank = 1 + count(logit > target_logit)`` over the full
+    (possibly tensor-parallel sharded) vocabulary. A rank of 1 means the target token
+    is the argmax of the model's distribution. Ties (vocab entries whose logit equals
+    the target logit) do NOT increase the rank, which matches the tie behavior of
+    ``topk_logit_analysis/score_topk.py``.
+
+    For a tensor-parallel sharded vocabulary, each rank counts how many of its local
+    logits beat the target logit, then the counts are summed across ``group`` to get the
+    global rank. The target logit itself is gathered from the shard that owns the target
+    id and broadcast via an all-reduce(SUM), mirroring the predicted-logit gather in
+    ``_ShardedCrossEntropy``.
+
+    Args:
+        sharded_logits: logits for this rank's vocab shard, shape ``(..., local_vocab_size)``.
+        target: target token ids (global vocab indices), shape ``(...)``.
+        group: tensor-parallel process group the vocab is sharded over. ``None`` (or a
+            group of size 1) means the full vocabulary is local and no communication is done.
+
+    Returns:
+        A ``torch.long`` tensor of shape ``target.shape`` with the global 1-based rank.
+    """
+    sharded_vocab_size = sharded_logits.shape[-1]
+    tp_rank = dist.get_rank(group) if group is not None else 0
+    tp_world_size = dist.get_world_size(group) if group is not None else 1
+    start_index = tp_rank * sharded_vocab_size
+    end_index = start_index + sharded_vocab_size
+
+    # Gather the logit assigned to each target token; only the owning shard holds it.
+    target_outside_shard = (target < start_index) | (target >= end_index)
+    local_target = target - start_index
+    local_target = local_target.masked_fill(target_outside_shard, 0)
+    logits_2d = sharded_logits.reshape(-1, sharded_vocab_size)
+    local_target_1d = local_target.reshape(-1)
+    arange_1d = torch.arange(0, logits_2d.shape[0], device=logits_2d.device)
+    target_logits = logits_2d[arange_1d, local_target_1d].view_as(target).clone()
+    target_logits = target_logits.masked_fill(target_outside_shard, 0.0)
+    if tp_world_size > 1:
+        dist.all_reduce(target_logits, op=dist.ReduceOp.SUM, group=group)
+
+    # Count, on this shard, how many logits are strictly greater than the target logit.
+    local_greater = (sharded_logits > target_logits.unsqueeze(-1)).sum(dim=-1)
+    if tp_world_size > 1:
+        dist.all_reduce(local_greater, op=dist.ReduceOp.SUM, group=group)
+
+    return 1 + local_greater.long()
+
+
+@torch.no_grad()
+def compute_topk_loss_mask(
+    sharded_logits,  # [batch_size, seq_length, local_vocab_size]
+    label_ids,  # [batch_size, seq_length]
+    label_mask,  # [batch_size, seq_length]
+    tp_pg: Optional[dist.ProcessGroup],
+    k: int,
+    max_drop_percent: float = 100.0,
+):
+    """Mask out target tokens that fall outside the model's own top-K predictions.
+
+    Self-scoring: the model's current logits rank each target token via
+    ``rank = 1 + count(logit > target_logit)`` over the full (tensor-parallel sharded)
+    vocabulary (see ``compute_target_token_ranks``). Tokens whose rank is greater than
+    ``k`` are "unlikely" under the model and are dropped from the loss.
+
+    Only positions that the incoming ``label_mask`` already keeps are eligible to be
+    dropped; the existing mask is always preserved (the returned mask is a subset of it).
+
+    ``max_drop_percent`` caps the fraction of currently-active tokens that may be dropped
+    in this batch. When more tokens than the cap qualify, the highest-rank (most unlikely)
+    ones are dropped first so the cap is respected deterministically. A value of 100.0
+    (the default) means no cap.
+
+    Returns a new mask with the same shape and dtype as ``label_mask``.
+    """
+    orig_dtype = label_mask.dtype
+    active = label_mask.bool()
+
+    ranks = compute_target_token_ranks(sharded_logits, label_ids, group=tp_pg)
+    # Candidate tokens to drop: currently active AND ranked outside the top-K.
+    drop_candidates = active & (ranks > k)
+
+    if max_drop_percent < 100.0:
+        num_active = int(active.sum().item())
+        max_drop = int((max_drop_percent / 100.0) * num_active)
+        num_candidates = int(drop_candidates.sum().item())
+        if num_candidates > max_drop:
+            # Keep only the `max_drop` most-unlikely (highest rank) candidates as drops.
+            # Non-candidates get rank -1 so they never win the top-`max_drop` selection.
+            candidate_ranks = torch.where(
+                drop_candidates, ranks, torch.full_like(ranks, -1)
+            ).reshape(-1)
+            if max_drop > 0:
+                drop_indices = torch.topk(candidate_ranks, k=max_drop).indices
+                flat_drop = torch.zeros_like(candidate_ranks, dtype=torch.bool)
+                flat_drop[drop_indices] = True
+                drop_candidates = flat_drop.reshape(drop_candidates.shape)
+            else:
+                drop_candidates = torch.zeros_like(drop_candidates)
+
+    new_mask = active & ~drop_candidates
+    return new_mask.to(orig_dtype)
+
+
 class _ColumnLinearAsyncCommunication(torch.autograd.Function):
     """Adapted from https://github.com/NVIDIA/Megatron-LM/blob/e6d7e09845590d0a36bc7f29eb28db974fb8da4e/megatron/core/tensor_parallel/layers.py#L215"""
 
