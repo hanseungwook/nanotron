@@ -149,10 +149,10 @@ class Qwen2Config:
     z_loss_coefficient: float = 0.0001  # Default from the paper (10^-4)
     # Top-K unlikely-token loss masking: mask out (exclude from the loss) any target token
     # that is NOT within the model's own top-K predictions for that position, i.e. whose
-    # self-scored rank (rank = 1 + count(logit > target_logit)) is greater than K.
+    # self-scored token rank (token_rank = 1 + count(logit > target_logit)) is greater than K.
     # Named to avoid colliding with generation `top_k` / MoE `top_k`.
     topk_loss_mask_enabled: bool = False  # Enable top-K unlikely-token loss masking
-    topk_loss_mask_k: Optional[int] = None  # Keep tokens whose self-scored rank is <= K
+    topk_loss_mask_k: Optional[int] = None  # Keep tokens whose self-scored token rank is <= K
     topk_loss_mask_max_drop_percent: float = 100.0  # Cap on % of active tokens that may be masked per batch
     no_rope_layer: Optional[
         int
