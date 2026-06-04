@@ -128,6 +128,16 @@ def test_high_k_drops_nothing():
     assert out.tolist() == [[True, True, True, True]]
 
 
+def test_all_dropped_candidates_preserve_original_mask():
+    # If every active token is outside top-K, keep the original mask for this
+    # microbatch rather than returning an empty mask that would make loss NaN.
+    logits = _logits([[3.0, 1.0, 2.0, 0.0]] * 2)
+    labels = torch.tensor([[1, 3]])  # token_ranks 3 and 4
+    mask = torch.tensor([[0.5, 2.0]], dtype=torch.float32)
+    out = compute_topk_loss_mask(logits, labels, mask, tp_pg=None, k=1)
+    assert out.tolist() == [[0.5, 2.0]]
+
+
 # ---------------------------------------------------------------------------
 # max_drop_percent cap
 # ---------------------------------------------------------------------------

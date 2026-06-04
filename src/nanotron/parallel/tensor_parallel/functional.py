@@ -276,12 +276,12 @@ def compute_target_token_ranks(
     logits_2d = sharded_logits.reshape(-1, sharded_vocab_size)
     local_target_1d = local_target.reshape(-1)
     arange_1d = torch.arange(0, logits_2d.shape[0], device=logits_2d.device)
-    target_logits = logits_2d[arange_1d, local_target_1d].view_as(target).clone()
+    target_logits = logits_2d[arange_1d, local_target_1d].view_as(target)
     target_logits = target_logits.masked_fill(target_outside_shard, 0.0)
     if tp_world_size > 1:
         dist.all_reduce(target_logits, op=dist.ReduceOp.SUM, group=group)
 
-    # Count, on this shard, how many logits are strictly greater than the target logit.
+    # Compare in the logits' dtype; ties from low precision intentionally follow the strict-`>` convention.
     local_greater = (sharded_logits > target_logits.unsqueeze(-1)).sum(dim=-1)
     if tp_world_size > 1:
         dist.all_reduce(local_greater, op=dist.ReduceOp.SUM, group=group)
@@ -311,9 +311,12 @@ def compute_topk_loss_mask(
     mask is therefore always element-wise ``<=`` the incoming mask.
 
     ``max_drop_percent`` caps the fraction of currently-active tokens that may be dropped
-    in this batch. When more tokens than the cap qualify, the highest-token-rank
+    in this forward microbatch. When more tokens than the cap qualify, the highest-token-rank
     (most unlikely) ones are dropped first; ties at the cutoff token rank are broken deterministically by
     position (lowest flat index first). A value of 100.0 (the default) means no cap.
+
+    If the top-K rule would drop every currently-active token, the top-K mask is skipped
+    for this call and the original ``label_mask`` is returned, avoiding an empty loss.
 
     Returns a new mask with the same shape and dtype as ``label_mask``.
     """
@@ -341,6 +344,10 @@ def compute_topk_loss_mask(
                 drop_candidates = flat_drop.reshape(drop_candidates.shape)
             else:
                 drop_candidates = torch.zeros_like(drop_candidates)
+
+    kept_active = active & ~drop_candidates
+    would_empty_loss_mask = active.any() & ~kept_active.any()
+    drop_candidates = drop_candidates & ~would_empty_loss_mask
 
     # Preserve original mask values for kept positions; zero out newly dropped ones.
     return torch.where(drop_candidates, torch.zeros_like(label_mask), label_mask)
