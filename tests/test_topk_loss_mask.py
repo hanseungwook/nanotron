@@ -107,6 +107,18 @@ def test_mask_preserves_dtype():
     assert out.tolist() == [[1.0, 0.0]]
 
 
+def test_preserves_non_binary_float_mask_values():
+    # A weighted (non-binary) float mask: kept positions must keep their original
+    # weight, dropped positions become 0 (not 1.0).
+    logits = _logits([[3.0, 1.0, 2.0, 0.0]] * 4)
+    labels = torch.tensor([[0, 2, 1, 3]])  # ranks 1, 2, 3, 4
+    mask = torch.tensor([[0.5, 2.0, 0.5, 2.0]], dtype=torch.float32)
+    out = compute_topk_loss_mask(logits, labels, mask, tp_pg=None, k=2)
+    # rank <= 2 kept with original weight (0.5, 2.0); rank > 2 dropped to 0.0.
+    assert out.dtype == torch.float32
+    assert out.tolist() == [[0.5, 2.0, 0.0, 0.0]]
+
+
 def test_high_k_drops_nothing():
     # With K >= vocab_size every target is within the top-K, so nothing is dropped.
     logits = _logits([[3.0, 1.0, 2.0, 0.0]] * 4)
@@ -132,6 +144,18 @@ def test_max_drop_percent_caps_number_of_drops():
     assert int(out.bool().sum()) == 2  # 2 dropped, 2 kept
     # The most-unlikely tokens (ranks 4 and 3 at positions 3 and 2) are the ones dropped.
     assert out.tolist() == [[True, True, False, False]]
+
+
+def test_max_drop_percent_tie_break_is_deterministic_by_index():
+    # All four active tokens share the same rank (4), so the cap must choose which to
+    # drop by a tie-break. The tie-break drops the lowest flat indices first.
+    logits = _logits([[3.0, 1.0, 2.0, 0.0]] * 4)
+    labels = torch.tensor([[3, 3, 3, 3]])  # every position -> rank 4
+    mask = torch.ones((1, 4), dtype=torch.bool)
+    # 50% of 4 active => drop exactly 2; with equal ranks, positions 0 and 1 are dropped.
+    out = compute_topk_loss_mask(logits, labels, mask, tp_pg=None, k=1, max_drop_percent=50.0)
+    assert int(out.bool().sum()) == 2
+    assert out.tolist() == [[False, False, True, True]]
 
 
 def test_max_drop_percent_zero_drops_nothing():

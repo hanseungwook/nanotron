@@ -306,16 +306,17 @@ def compute_topk_loss_mask(
     ``k`` are "unlikely" under the model and are dropped from the loss.
 
     Only positions that the incoming ``label_mask`` already keeps are eligible to be
-    dropped; the existing mask is always preserved (the returned mask is a subset of it).
+    dropped, and kept positions retain their original ``label_mask`` value (e.g. a
+    weighted/float mask keeps its weight); dropped positions become zero. The returned
+    mask is therefore always element-wise ``<=`` the incoming mask.
 
     ``max_drop_percent`` caps the fraction of currently-active tokens that may be dropped
     in this batch. When more tokens than the cap qualify, the highest-rank (most unlikely)
-    ones are dropped first so the cap is respected deterministically. A value of 100.0
-    (the default) means no cap.
+    ones are dropped first; ties at the cutoff rank are broken deterministically by
+    position (lowest flat index first). A value of 100.0 (the default) means no cap.
 
     Returns a new mask with the same shape and dtype as ``label_mask``.
     """
-    orig_dtype = label_mask.dtype
     active = label_mask.bool()
 
     ranks = compute_target_token_ranks(sharded_logits, label_ids, group=tp_pg)
@@ -327,21 +328,22 @@ def compute_topk_loss_mask(
         max_drop = int((max_drop_percent / 100.0) * num_active)
         num_candidates = int(drop_candidates.sum().item())
         if num_candidates > max_drop:
-            # Keep only the `max_drop` most-unlikely (highest rank) candidates as drops.
-            # Non-candidates get rank -1 so they never win the top-`max_drop` selection.
-            candidate_ranks = torch.where(
-                drop_candidates, ranks, torch.full_like(ranks, -1)
-            ).reshape(-1)
             if max_drop > 0:
-                drop_indices = torch.topk(candidate_ranks, k=max_drop).indices
-                flat_drop = torch.zeros_like(candidate_ranks, dtype=torch.bool)
-                flat_drop[drop_indices] = True
+                # Keep only the `max_drop` most-unlikely (highest rank) candidates as drops.
+                # Tie-break deterministically: a stable argsort over the ascending candidate
+                # indices means equal-rank candidates are dropped lowest-flat-index first.
+                cand_indices = drop_candidates.reshape(-1).nonzero(as_tuple=True)[0]
+                cand_ranks = ranks.reshape(-1)[cand_indices]
+                order = torch.argsort(cand_ranks, descending=True, stable=True)
+                chosen = cand_indices[order[:max_drop]]
+                flat_drop = torch.zeros(drop_candidates.numel(), dtype=torch.bool, device=drop_candidates.device)
+                flat_drop[chosen] = True
                 drop_candidates = flat_drop.reshape(drop_candidates.shape)
             else:
                 drop_candidates = torch.zeros_like(drop_candidates)
 
-    new_mask = active & ~drop_candidates
-    return new_mask.to(orig_dtype)
+    # Preserve original mask values for kept positions; zero out newly dropped ones.
+    return torch.where(drop_candidates, torch.zeros_like(label_mask), label_mask)
 
 
 class _ColumnLinearAsyncCommunication(torch.autograd.Function):
