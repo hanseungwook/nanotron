@@ -222,3 +222,82 @@ def test_config_max_drop_percent_out_of_range_rejected():
         Qwen2Config(vocab_size=100, topk_loss_mask_enabled=True, topk_loss_mask_k=8, topk_loss_mask_max_drop_percent=150.0)
     with pytest.raises(AssertionError):
         Qwen2Config(vocab_size=100, topk_loss_mask_enabled=True, topk_loss_mask_k=8, topk_loss_mask_max_drop_percent=-1.0)
+
+
+# ---------------------------------------------------------------------------
+# Mask-diff stats (used for WandB logging in trainer.py)
+# ---------------------------------------------------------------------------
+
+
+def _stats_from_masks(orig_mask, new_mask):
+    """Replicate the stats computation from Loss._maybe_apply_topk_loss_mask."""
+    orig_active = orig_mask.bool()
+    drop_mask = orig_active & ~new_mask.bool()
+    return {
+        "masked_tokens": drop_mask.sum().item(),
+        "eligible_tokens": orig_active.sum().item(),
+        "position_drop_counts": drop_mask.sum(dim=0).tolist(),
+    }
+
+
+def test_stats_normal_drop():
+    # Ranks: positions 0→1, 1→2, 2→3, 3→4. k=2 drops positions 2 and 3.
+    logits = _logits([[3.0, 1.0, 2.0, 0.0]] * 4)
+    labels = torch.tensor([[0, 2, 1, 3]])
+    orig_mask = torch.ones((1, 4), dtype=torch.bool)
+    new_mask = compute_topk_loss_mask(logits, labels, orig_mask, tp_pg=None, k=2)
+
+    stats = _stats_from_masks(orig_mask, new_mask)
+    assert stats["masked_tokens"] == 2
+    assert stats["eligible_tokens"] == 4
+    assert stats["position_drop_counts"] == [0, 0, 1, 1]
+
+
+def test_stats_eligible_uses_bool_count_not_sum_of_weights():
+    # Float weighted mask: eligible should be count of non-zero positions, not sum.
+    logits = _logits([[3.0, 1.0, 2.0, 0.0]] * 4)
+    labels = torch.tensor([[0, 2, 1, 3]])
+    orig_mask = torch.tensor([[0.5, 2.0, 0.5, 2.0]], dtype=torch.float32)
+    new_mask = compute_topk_loss_mask(logits, labels, orig_mask, tp_pg=None, k=2)
+
+    stats = _stats_from_masks(orig_mask, new_mask)
+    assert stats["eligible_tokens"] == 4  # 4 active positions, not sum 5.0
+    assert stats["masked_tokens"] == 2  # positions 2 and 3 dropped
+
+
+def test_stats_all_dropped_fallback_shows_zero_dropped():
+    # When all tokens would be dropped the mask falls back to the original,
+    # so no tokens are actually dropped and stats should reflect that.
+    logits = _logits([[3.0, 1.0, 2.0, 0.0]] * 2)
+    labels = torch.tensor([[1, 3]])  # token_ranks 3 and 4, both outside k=1
+    orig_mask = torch.ones((1, 2), dtype=torch.float32)
+    new_mask = compute_topk_loss_mask(logits, labels, orig_mask, tp_pg=None, k=1)
+
+    stats = _stats_from_masks(orig_mask, new_mask)
+    assert stats["masked_tokens"] == 0  # fallback preserved all tokens
+    assert stats["eligible_tokens"] == 2
+    assert stats["position_drop_counts"] == [0, 0]
+
+
+def test_stats_max_drop_percent_cap():
+    # 4 active tokens, k=1 would drop 3 but cap is 50% → only 2 dropped.
+    logits = _logits([[3.0, 1.0, 2.0, 0.0]] * 4)
+    labels = torch.tensor([[0, 2, 1, 3]])  # token_ranks 1, 2, 3, 4
+    orig_mask = torch.ones((1, 4), dtype=torch.bool)
+    new_mask = compute_topk_loss_mask(logits, labels, orig_mask, tp_pg=None, k=1, max_drop_percent=50.0)
+
+    stats = _stats_from_masks(orig_mask, new_mask)
+    assert stats["masked_tokens"] == 2
+    assert stats["eligible_tokens"] == 4
+
+
+def test_stats_with_already_masked_positions():
+    # Position 1 is pre-masked (False); stats should not count it as dropped.
+    logits = _logits([[3.0, 1.0, 2.0, 0.0]] * 4)
+    labels = torch.tensor([[0, 0, 1, 3]])  # token_ranks 1, 1, 3, 4
+    orig_mask = torch.tensor([[True, False, True, True]])
+    new_mask = compute_topk_loss_mask(logits, labels, orig_mask, tp_pg=None, k=2)
+
+    stats = _stats_from_masks(orig_mask, new_mask)
+    assert stats["eligible_tokens"] == 3  # only 3 active in original mask
+    assert stats["masked_tokens"] == 2    # positions 2 and 3 dropped by topk

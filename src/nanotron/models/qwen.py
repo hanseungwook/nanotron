@@ -871,9 +871,16 @@ class Loss(nn.Module):
         self.topk_loss_mask_max_drop_percent = topk_loss_mask_max_drop_percent
 
     def _maybe_apply_topk_loss_mask(self, sharded_logits, label_ids, label_mask):
+        """Apply top-K loss mask if enabled; return (new_mask, stats_dict).
+
+        stats_dict is empty when topk masking is disabled.  When enabled it
+        contains float scalars/vectors that are safe to include in the pipeline
+        output dict and DP-reduce in the trainer for WandB logging.
+        """
         if not self.topk_loss_mask_enabled:
-            return label_mask
-        return compute_topk_loss_mask(
+            return label_mask, {}
+        orig_active = label_mask.bool()
+        new_mask = compute_topk_loss_mask(
             sharded_logits,
             label_ids,
             label_mask,
@@ -881,6 +888,16 @@ class Loss(nn.Module):
             k=self.topk_loss_mask_k,
             max_drop_percent=self.topk_loss_mask_max_drop_percent,
         )
+        drop_mask = orig_active & ~new_mask.bool()
+        stats = {
+            # Scalar counts (float for easy stacking/reducing in the trainer).
+            "topk_loss_masked_tokens": drop_mask.sum().detach().float(),
+            # Eligible = active label positions (count, not summed weight).
+            "topk_loss_eligible_tokens": orig_active.sum().detach().float(),
+            # Per-sequence-position drop count; shape [seq_len].
+            "topk_loss_position_drop_counts": drop_mask.sum(dim=0).detach().float(),
+        }
+        return new_mask, stats
 
     def forward(
         self,
@@ -889,10 +906,10 @@ class Loss(nn.Module):
         label_mask: torch.Tensor,  # [batch_size, seq_length]
     ) -> Dict[str, torch.Tensor]:
         sharded_logits = sharded_logits.view(label_ids.shape[0], label_ids.shape[1], -1)
-        label_mask = self._maybe_apply_topk_loss_mask(sharded_logits, label_ids, label_mask)
+        label_mask, topk_stats = self._maybe_apply_topk_loss_mask(sharded_logits, label_ids, label_mask)
         loss = sharded_cross_entropy(sharded_logits, label_ids.contiguous(), group=self.tp_pg, dtype=torch.float)
         loss = masked_mean(loss, label_mask, dtype=torch.float)
-        return {"loss": loss}
+        return {"loss": loss, **topk_stats}
 
 
 class LossWithZLoss(Loss):
@@ -919,13 +936,13 @@ class LossWithZLoss(Loss):
         label_mask: torch.Tensor,  # [batch_size, seq_length]
     ) -> Dict[str, torch.Tensor]:
         sharded_logits = sharded_logits.view(label_ids.shape[0], label_ids.shape[1], -1)
-        label_mask = self._maybe_apply_topk_loss_mask(sharded_logits, label_ids, label_mask)
+        label_mask, topk_stats = self._maybe_apply_topk_loss_mask(sharded_logits, label_ids, label_mask)
         loss, z_loss = sharded_cross_entropy(
             sharded_logits, label_ids.contiguous(), group=self.tp_pg, dtype=torch.float, z_loss_coef=self.z_loss_coef
         )
         loss = masked_mean(loss, label_mask, dtype=torch.float)
         z_loss = masked_mean(z_loss.detach(), label_mask, dtype=torch.float)
-        return {"loss": loss, "z_loss": z_loss}
+        return {"loss": loss, "z_loss": z_loss, **topk_stats}
 
 from nanotron.logging import LoggingCollectorMixin
 class Qwen2ForTraining(NanotronModel, LoggingCollectorMixin):
@@ -949,6 +966,12 @@ class Qwen2ForTraining(NanotronModel, LoggingCollectorMixin):
         if config.z_loss_enabled:
             loss_kwargs["z_loss_coefficient"] = config.z_loss_coefficient
 
+        topk_output_keys = (
+            {"topk_loss_masked_tokens", "topk_loss_eligible_tokens", "topk_loss_position_drop_counts"}
+            if config.topk_loss_mask_enabled
+            else set()
+        )
+        base_output_keys = {"loss", "z_loss"} if config.z_loss_enabled else {"loss"}
         self.loss = PipelineBlock(
             p2p=self.model.p2p,
             module_builder=LossWithZLoss if config.z_loss_enabled else Loss,
@@ -958,7 +981,7 @@ class Qwen2ForTraining(NanotronModel, LoggingCollectorMixin):
                 "label_ids",
                 "label_mask",
             },
-            module_output_keys={"loss", "z_loss"} if config.z_loss_enabled else {"loss"},
+            module_output_keys=base_output_keys | topk_output_keys,
         )
         self.parallel_context = parallel_context
         self.config = config
@@ -980,10 +1003,13 @@ class Qwen2ForTraining(NanotronModel, LoggingCollectorMixin):
             label_ids=label_ids,
             label_mask=label_mask,
         )
+        result: Dict[str, Union[torch.Tensor, TensorPointer]] = {"loss": loss["loss"]}
         if self.config.z_loss_enabled:
-            return {"loss": loss["loss"], "z_loss": loss["z_loss"]}
-        else:
-            return {"loss": loss["loss"]}
+            result["z_loss"] = loss["z_loss"]
+        if self.config.topk_loss_mask_enabled:
+            for k in ("topk_loss_masked_tokens", "topk_loss_eligible_tokens", "topk_loss_position_drop_counts"):
+                result[k] = loss[k]
+        return result
 
     @torch.no_grad()
     def init_model_randomly(self, config: Config):
