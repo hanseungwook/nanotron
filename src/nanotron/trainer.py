@@ -120,6 +120,95 @@ except ImportError:
     wandb = None
 
 
+_TOPK_LOSS_NUM_POSITION_BINS = 128
+
+
+def _collect_topk_loss_mask_logs(
+    outputs: Iterable[Dict[str, Union[torch.Tensor, "TensorPointer"]]],
+    dp_pg: dist.ProcessGroup,
+    iteration_step: int,
+    include_wandb_chart: bool = False,
+) -> Tuple[List[LogItem], Dict]:
+    """DP-reduce top-K loss mask statistics and build WandB log entries.
+
+    Returns a list of scalar LogItems and a dict of extra wandb objects (e.g.
+    a custom chart).  Both are empty when topk masking is disabled or when the
+    calling rank holds only TensorPointers (non-last PP stage).
+
+    The all_reduce calls must be reached by every rank in dp_pg, so callers
+    must invoke this function unconditionally on all ranks.
+
+    ``include_wandb_chart`` must only be True on ranks that will actually call
+    ``wandb.log``; this prevents non-logging ranks from allocating WandB objects
+    and avoids failures on wandb installs that lack the custom-plot API.
+    """
+    tensor_outputs = [
+        output
+        for output in outputs
+        if isinstance(output.get("topk_loss_eligible_tokens"), torch.Tensor)
+        and isinstance(output.get("topk_loss_masked_tokens"), torch.Tensor)
+    ]
+    if not tensor_outputs:
+        return [], {}
+
+    # Accumulate across microbatches then synchronise across DP ranks.
+    eligible_tokens = torch.stack([o["topk_loss_eligible_tokens"] for o in tensor_outputs]).sum()
+    masked_tokens = torch.stack([o["topk_loss_masked_tokens"] for o in tensor_outputs]).sum()
+    dist.all_reduce(eligible_tokens, group=dp_pg, op=dist.ReduceOp.SUM)
+    dist.all_reduce(masked_tokens, group=dp_pg, op=dist.ReduceOp.SUM)
+
+    drop_fraction = masked_tokens.float() / eligible_tokens.clamp_min(1).float()
+    drop_percent = drop_fraction * 100.0
+
+    log_items: List[LogItem] = [
+        LogItem("topk_loss_mask/masked_tokens", masked_tokens.item(), "human_format"),
+        LogItem("topk_loss_mask/eligible_tokens", eligible_tokens.item(), "human_format"),
+        LogItem("topk_loss_mask/drop_fraction", drop_fraction.item(), "human_format"),
+        LogItem("topk_loss_mask/drop_percent", drop_percent.item(), "human_format"),
+    ]
+
+    extra_wandb: Dict = {}
+    position_counts = [
+        o["topk_loss_position_drop_counts"]
+        for o in tensor_outputs
+        if isinstance(o.get("topk_loss_position_drop_counts"), torch.Tensor)
+    ]
+    if position_counts:
+        total_pos_counts = torch.stack(position_counts).sum(dim=0)
+        dist.all_reduce(total_pos_counts, group=dp_pg, op=dist.ReduceOp.SUM)
+
+        seq_len = total_pos_counts.numel()
+        num_bins = _TOPK_LOSS_NUM_POSITION_BINS
+        total_dropped = masked_tokens.clamp_min(1).float()
+
+        bin_fractions: List[float] = []
+        for bin_idx in range(num_bins):
+            start = bin_idx * seq_len // num_bins
+            end = (bin_idx + 1) * seq_len // num_bins
+            bin_frac = total_pos_counts[start:end].sum().float() / total_dropped
+            bin_fractions.append(bin_frac.item())
+            log_items.append(
+                LogItem(f"topk_loss_mask/position_bin_{bin_idx:03d}", bin_frac.item(), "human_format")
+            )
+
+        if include_wandb_chart and wandb is not None:
+            try:
+                table = wandb.Table(columns=["iteration_step", "bin_index", "drop_fraction"])
+                for i, frac in enumerate(bin_fractions):
+                    table.add_row(iteration_step, i, frac)
+                extra_wandb["topk_loss_mask/position_bins_chart"] = wandb.plot.line(
+                    table,
+                    x="bin_index",
+                    y="drop_fraction",
+                    title=f"TopK Drop by Position (step {iteration_step})",
+                )
+            except Exception:
+                # Scalar metrics above are already captured; chart is best-effort.
+                extra_wandb = {}
+
+    return log_items, extra_wandb
+
+
 def get_size(bytes):
     """Convert bytes to human readable format"""
     for unit in ["", "K", "M", "B", "T", "P"]:
@@ -853,6 +942,24 @@ class DistributedTrainer:
                 5, LogItem("grad_norm", self.grad_norm_unclipped.item(), "human_format")
             )  # , ".3f"))
 
+        # Compute wandb eligibility early so _collect_topk_loss_mask_logs only
+        # builds chart objects on ranks that will actually call wandb.log.
+        should_log_to_wandb = wandb is not None and (
+            (tp_size > 1 and dp_cp_rank == 0 and self.metrics_logging.log_level > 0)
+            or (tp_size > 1 and world_rank == self.logger_ranks[0] and self.metrics_logging.log_level == 0)
+            or (tp_size == 1 and world_rank == self.logger_ranks[0])
+        )
+
+        # Top-K loss mask stats: DP all-reduce called on every rank unconditionally;
+        # WandB chart object only created on the rank that will log.
+        topk_log_items, topk_wandb_extra = _collect_topk_loss_mask_logs(
+            outputs=outputs,
+            dp_pg=self.parallel_context.dp_pg,
+            iteration_step=self.iteration_step,
+            include_wandb_chart=should_log_to_wandb,
+        )
+        basic_log_entries.extend(topk_log_items)
+
         # Console logging only on logger ranks
         if dist.get_rank(self.parallel_context.world_pg) in self.logger_ranks:
             assert self.loggerwriter is not None, "loggerwriter should be defined on logger ranks"
@@ -891,12 +998,7 @@ class DistributedTrainer:
                         ]
                     )
 
-        # WandB logging - determine if this rank should log to wandb
-        should_log_to_wandb = wandb is not None and (
-            (tp_size > 1 and dp_cp_rank == 0 and self.metrics_logging.log_level > 0)
-            or (tp_size > 1 and world_rank == self.logger_ranks[0] and self.metrics_logging.log_level == 0)
-            or (tp_size == 1 and world_rank == self.logger_ranks[0])  # For TP>1, log from each TP group's dp=0 rank
-        )
+        # WandB logging (should_log_to_wandb computed earlier, before topk collection)
         should_log_detailed_metrics_to_wandb = (
             should_log_to_wandb
             and self.metrics_logging.log_level > 0
@@ -943,6 +1045,7 @@ class DistributedTrainer:
                 {
                     **{log_item.tag: log_item.scalar_value for log_item in all_log_entries},
                     **tp_group_info,
+                    **topk_wandb_extra,
                     "iteration_step": self.iteration_step,
                 },
                 step=self.iteration_step,
@@ -957,6 +1060,7 @@ class DistributedTrainer:
             wandb.log(
                 {
                     **{log_item.tag: log_item.scalar_value for log_item in basic_log_entries},
+                    **topk_wandb_extra,
                     "iteration_step": self.iteration_step,
                 },
                 step=self.iteration_step,
