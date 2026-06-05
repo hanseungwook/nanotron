@@ -127,6 +127,7 @@ def _collect_topk_loss_mask_logs(
     outputs: Iterable[Dict[str, Union[torch.Tensor, "TensorPointer"]]],
     dp_pg: dist.ProcessGroup,
     iteration_step: int,
+    include_wandb_chart: bool = False,
 ) -> Tuple[List[LogItem], Dict]:
     """DP-reduce top-K loss mask statistics and build WandB log entries.
 
@@ -136,6 +137,10 @@ def _collect_topk_loss_mask_logs(
 
     The all_reduce calls must be reached by every rank in dp_pg, so callers
     must invoke this function unconditionally on all ranks.
+
+    ``include_wandb_chart`` must only be True on ranks that will actually call
+    ``wandb.log``; this prevents non-logging ranks from allocating WandB objects
+    and avoids failures on wandb installs that lack the custom-plot API.
     """
     tensor_outputs = [
         output
@@ -186,16 +191,20 @@ def _collect_topk_loss_mask_logs(
                 LogItem(f"topk_loss_mask/position_bin_{bin_idx:03d}", bin_frac.item(), "human_format")
             )
 
-        if wandb is not None:
-            table = wandb.Table(columns=["bin_index", "drop_fraction"])
-            for i, frac in enumerate(bin_fractions):
-                table.add_row(i, frac)
-            extra_wandb["topk_loss_mask/position_bins_chart"] = wandb.plot.line(
-                table,
-                x="bin_index",
-                y="drop_fraction",
-                title=f"TopK Drop by Position (step {iteration_step})",
-            )
+        if include_wandb_chart and wandb is not None:
+            try:
+                table = wandb.Table(columns=["iteration_step", "bin_index", "drop_fraction"])
+                for i, frac in enumerate(bin_fractions):
+                    table.add_row(iteration_step, i, frac)
+                extra_wandb["topk_loss_mask/position_bins_chart"] = wandb.plot.line(
+                    table,
+                    x="bin_index",
+                    y="drop_fraction",
+                    title=f"TopK Drop by Position (step {iteration_step})",
+                )
+            except Exception:
+                # Scalar metrics above are already captured; chart is best-effort.
+                extra_wandb = {}
 
     return log_items, extra_wandb
 
@@ -933,11 +942,21 @@ class DistributedTrainer:
                 5, LogItem("grad_norm", self.grad_norm_unclipped.item(), "human_format")
             )  # , ".3f"))
 
-        # Top-K loss mask stats: DP all-reduce called on every rank unconditionally.
+        # Compute wandb eligibility early so _collect_topk_loss_mask_logs only
+        # builds chart objects on ranks that will actually call wandb.log.
+        should_log_to_wandb = wandb is not None and (
+            (tp_size > 1 and dp_cp_rank == 0 and self.metrics_logging.log_level > 0)
+            or (tp_size > 1 and world_rank == self.logger_ranks[0] and self.metrics_logging.log_level == 0)
+            or (tp_size == 1 and world_rank == self.logger_ranks[0])
+        )
+
+        # Top-K loss mask stats: DP all-reduce called on every rank unconditionally;
+        # WandB chart object only created on the rank that will log.
         topk_log_items, topk_wandb_extra = _collect_topk_loss_mask_logs(
             outputs=outputs,
             dp_pg=self.parallel_context.dp_pg,
             iteration_step=self.iteration_step,
+            include_wandb_chart=should_log_to_wandb,
         )
         basic_log_entries.extend(topk_log_items)
 
@@ -979,12 +998,7 @@ class DistributedTrainer:
                         ]
                     )
 
-        # WandB logging - determine if this rank should log to wandb
-        should_log_to_wandb = wandb is not None and (
-            (tp_size > 1 and dp_cp_rank == 0 and self.metrics_logging.log_level > 0)
-            or (tp_size > 1 and world_rank == self.logger_ranks[0] and self.metrics_logging.log_level == 0)
-            or (tp_size == 1 and world_rank == self.logger_ranks[0])  # For TP>1, log from each TP group's dp=0 rank
-        )
+        # WandB logging (should_log_to_wandb computed earlier, before topk collection)
         should_log_detailed_metrics_to_wandb = (
             should_log_to_wandb
             and self.metrics_logging.log_level > 0
