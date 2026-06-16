@@ -1,0 +1,303 @@
+"""Tests for self-scored top-K unlikely-token loss masking.
+
+These tests exercise the pure (non-distributed) logic of the masking:
+  * ``compute_target_token_ranks`` — the self-scored token rank of each target token.
+  * ``compute_topk_loss_mask``     — turning token ranks into an updated label_mask.
+  * ``Qwen2Config`` validation     — config-level guard rails.
+
+They run single-process (tensor-parallel group ``None``, i.e. the full vocab is
+local), which is enough to cover the token-ranking convention, the ``token_rank > K`` (not
+``>=``) boundary, label_mask preservation, the no-op/disabled paths and the
+``max_drop_percent`` cap. The tensor-parallel all-reduce paths are exercised by
+the existing distributed test harness for ``sharded_cross_entropy``.
+"""
+
+import pytest
+import torch
+
+from nanotron.config.models_config import Qwen2Config
+from nanotron.parallel.tensor_parallel.functional import (
+    compute_target_token_ranks,
+    compute_topk_loss_mask,
+)
+
+
+def _logits(rows):
+    """Build a [1, len(rows), vocab] logits tensor from a list of per-position rows."""
+    return torch.tensor([rows], dtype=torch.float)
+
+
+# ---------------------------------------------------------------------------
+# compute_target_token_ranks
+# ---------------------------------------------------------------------------
+
+
+def test_rank_is_one_for_argmax_target():
+    # Position picks the highest-logit token => token_rank 1.
+    logits = _logits([[3.0, 1.0, 2.0, 0.0]])
+    target = torch.tensor([[0]])  # token 0 has the max logit
+    token_ranks = compute_target_token_ranks(logits, target, group=None)
+    assert token_ranks.tolist() == [[1]]
+
+
+def test_rank_counts_strictly_greater_logits():
+    # logits sorted desc: token0(3) > token2(2) > token1(1) > token3(0)
+    logits = _logits([[3.0, 1.0, 2.0, 0.0]])
+    # target token 2 has 1 logit strictly greater (token0) => token_rank 2
+    assert compute_target_token_ranks(logits, torch.tensor([[2]]), group=None).tolist() == [[2]]
+    # target token 1 has 2 strictly greater (token0, token2) => token_rank 3
+    assert compute_target_token_ranks(logits, torch.tensor([[1]]), group=None).tolist() == [[3]]
+    # target token 3 (lowest) => token_rank 4
+    assert compute_target_token_ranks(logits, torch.tensor([[3]]), group=None).tolist() == [[4]]
+
+
+def test_rank_tie_does_not_increase_rank():
+    # Two tokens tie for the top logit. Ties (equal logits) are NOT counted as
+    # "strictly greater", matching score_topk.py's `token_rank = 1 + count(logit > target)`.
+    logits = _logits([[5.0, 5.0, 1.0]])
+    # token0 and token1 both have 0 strictly-greater logits => both token_rank 1.
+    assert compute_target_token_ranks(logits, torch.tensor([[0]]), group=None).tolist() == [[1]]
+    assert compute_target_token_ranks(logits, torch.tensor([[1]]), group=None).tolist() == [[1]]
+    # token2 has 2 strictly greater => token_rank 3.
+    assert compute_target_token_ranks(logits, torch.tensor([[2]]), group=None).tolist() == [[3]]
+
+
+# ---------------------------------------------------------------------------
+# compute_topk_loss_mask
+# ---------------------------------------------------------------------------
+
+
+def test_mask_drops_tokens_outside_topk():
+    # Ranks per position: token0->1, token2->2, token1->3, token3->4 (same logits each pos).
+    logits = _logits([[3.0, 1.0, 2.0, 0.0]] * 4)
+    labels = torch.tensor([[0, 2, 1, 3]])  # token_ranks 1, 2, 3, 4
+    mask = torch.ones((1, 4), dtype=torch.bool)
+    out = compute_topk_loss_mask(logits, labels, mask, tp_pg=None, k=2)
+    # token_rank <= 2 kept (positions 0,1), token_rank > 2 dropped (positions 2,3).
+    assert out.tolist() == [[True, True, False, False]]
+
+
+def test_boundary_uses_strict_greater_than_k():
+    # A token whose token_rank == K must be KEPT (drop uses token_rank > K, not >=).
+    logits = _logits([[3.0, 1.0, 2.0, 0.0]] * 2)
+    labels = torch.tensor([[2, 1]])  # token_ranks 2 and 3
+    mask = torch.ones((1, 2), dtype=torch.bool)
+    out = compute_topk_loss_mask(logits, labels, mask, tp_pg=None, k=2)
+    assert out.tolist() == [[True, False]]  # token_rank 2 kept, token_rank 3 dropped
+
+
+def test_preserves_existing_label_mask():
+    # An already-masked position (token_rank 1, would otherwise be kept) must stay masked.
+    logits = _logits([[3.0, 1.0, 2.0, 0.0]] * 4)
+    labels = torch.tensor([[0, 0, 1, 3]])  # token_ranks 1, 1, 3, 4
+    mask = torch.tensor([[True, False, True, True]])
+    out = compute_topk_loss_mask(logits, labels, mask, tp_pg=None, k=2)
+    # pos0 token_rank 1 kept; pos1 already False -> stays False; pos2/pos3 token_rank > 2 dropped.
+    assert out.tolist() == [[True, False, False, False]]
+    # Returned mask is always a subset of the incoming mask.
+    assert bool((out.bool() & ~mask.bool()).any()) is False
+
+
+def test_mask_preserves_dtype():
+    logits = _logits([[3.0, 1.0, 2.0, 0.0]] * 2)
+    labels = torch.tensor([[0, 3]])
+    mask = torch.ones((1, 2), dtype=torch.float32)
+    out = compute_topk_loss_mask(logits, labels, mask, tp_pg=None, k=2)
+    assert out.dtype == torch.float32
+    assert out.tolist() == [[1.0, 0.0]]
+
+
+def test_preserves_non_binary_float_mask_values():
+    # A weighted (non-binary) float mask: kept positions must keep their original
+    # weight, dropped positions become 0 (not 1.0).
+    logits = _logits([[3.0, 1.0, 2.0, 0.0]] * 4)
+    labels = torch.tensor([[0, 2, 1, 3]])  # token_ranks 1, 2, 3, 4
+    mask = torch.tensor([[0.5, 2.0, 0.5, 2.0]], dtype=torch.float32)
+    out = compute_topk_loss_mask(logits, labels, mask, tp_pg=None, k=2)
+    # token_rank <= 2 kept with original weight (0.5, 2.0); token_rank > 2 dropped to 0.0.
+    assert out.dtype == torch.float32
+    assert out.tolist() == [[0.5, 2.0, 0.0, 0.0]]
+
+
+def test_high_k_drops_nothing():
+    # With K >= vocab_size every target is within the top-K, so nothing is dropped.
+    logits = _logits([[3.0, 1.0, 2.0, 0.0]] * 4)
+    labels = torch.tensor([[0, 1, 2, 3]])
+    mask = torch.ones((1, 4), dtype=torch.bool)
+    out = compute_topk_loss_mask(logits, labels, mask, tp_pg=None, k=4)
+    assert out.tolist() == [[True, True, True, True]]
+
+
+def test_all_dropped_candidates_preserve_original_mask():
+    # If every active token is outside top-K, keep the original mask for this
+    # microbatch rather than returning an empty mask that would make loss NaN.
+    logits = _logits([[3.0, 1.0, 2.0, 0.0]] * 2)
+    labels = torch.tensor([[1, 3]])  # token_ranks 3 and 4
+    mask = torch.tensor([[0.5, 2.0]], dtype=torch.float32)
+    out = compute_topk_loss_mask(logits, labels, mask, tp_pg=None, k=1)
+    assert out.tolist() == [[0.5, 2.0]]
+
+
+# ---------------------------------------------------------------------------
+# max_drop_percent cap
+# ---------------------------------------------------------------------------
+
+
+def test_max_drop_percent_caps_number_of_drops():
+    # 4 active tokens, 3 of them token-rank outside top-1 and would be dropped.
+    logits = _logits([[3.0, 1.0, 2.0, 0.0]] * 4)
+    labels = torch.tensor([[0, 2, 1, 3]])  # token_ranks 1, 2, 3, 4
+    mask = torch.ones((1, 4), dtype=torch.bool)
+
+    # Cap drops at 50% of 4 active => at most 2 drops, the two HIGHEST token_ranks (4 then 3).
+    out = compute_topk_loss_mask(logits, labels, mask, tp_pg=None, k=1, max_drop_percent=50.0)
+    assert int(out.bool().sum()) == 2  # 2 dropped, 2 kept
+    # The most-unlikely tokens (token_ranks 4 and 3 at positions 3 and 2) are the ones dropped.
+    assert out.tolist() == [[True, True, False, False]]
+
+
+def test_max_drop_percent_tie_break_is_deterministic_by_index():
+    # All four active tokens share the same token_rank (4), so the cap must choose which to
+    # drop by a tie-break. The tie-break drops the lowest flat indices first.
+    logits = _logits([[3.0, 1.0, 2.0, 0.0]] * 4)
+    labels = torch.tensor([[3, 3, 3, 3]])  # every position -> token_rank 4
+    mask = torch.ones((1, 4), dtype=torch.bool)
+    # 50% of 4 active => drop exactly 2; with equal token_ranks, positions 0 and 1 are dropped.
+    out = compute_topk_loss_mask(logits, labels, mask, tp_pg=None, k=1, max_drop_percent=50.0)
+    assert int(out.bool().sum()) == 2
+    assert out.tolist() == [[False, False, True, True]]
+
+
+def test_max_drop_percent_zero_drops_nothing():
+    logits = _logits([[3.0, 1.0, 2.0, 0.0]] * 4)
+    labels = torch.tensor([[0, 2, 1, 3]])
+    mask = torch.ones((1, 4), dtype=torch.bool)
+    out = compute_topk_loss_mask(logits, labels, mask, tp_pg=None, k=1, max_drop_percent=0.0)
+    assert out.tolist() == [[True, True, True, True]]
+
+
+def test_default_max_drop_percent_no_cap():
+    # Default 100.0 => no cap, all out-of-topK tokens dropped.
+    logits = _logits([[3.0, 1.0, 2.0, 0.0]] * 4)
+    labels = torch.tensor([[0, 2, 1, 3]])
+    mask = torch.ones((1, 4), dtype=torch.bool)
+    out = compute_topk_loss_mask(logits, labels, mask, tp_pg=None, k=1)
+    assert out.tolist() == [[True, False, False, False]]
+
+
+# ---------------------------------------------------------------------------
+# Qwen2Config validation
+# ---------------------------------------------------------------------------
+
+
+def test_config_disabled_by_default():
+    cfg = Qwen2Config(vocab_size=100)
+    assert cfg.topk_loss_mask_enabled is False
+    assert cfg.topk_loss_mask_k is None
+    assert cfg.topk_loss_mask_max_drop_percent == 100.0
+
+
+def test_config_enabled_requires_k():
+    with pytest.raises(AssertionError):
+        Qwen2Config(vocab_size=100, topk_loss_mask_enabled=True)
+
+
+def test_config_k_must_be_positive():
+    with pytest.raises(AssertionError):
+        Qwen2Config(vocab_size=100, topk_loss_mask_enabled=True, topk_loss_mask_k=0)
+
+
+def test_config_k_must_be_less_than_vocab_size():
+    with pytest.raises(AssertionError):
+        Qwen2Config(vocab_size=100, topk_loss_mask_enabled=True, topk_loss_mask_k=100)
+
+
+def test_config_valid_when_enabled_with_k():
+    cfg = Qwen2Config(vocab_size=100, topk_loss_mask_enabled=True, topk_loss_mask_k=8)
+    assert cfg.topk_loss_mask_k == 8
+
+
+def test_config_max_drop_percent_out_of_range_rejected():
+    with pytest.raises(AssertionError):
+        Qwen2Config(vocab_size=100, topk_loss_mask_enabled=True, topk_loss_mask_k=8, topk_loss_mask_max_drop_percent=150.0)
+    with pytest.raises(AssertionError):
+        Qwen2Config(vocab_size=100, topk_loss_mask_enabled=True, topk_loss_mask_k=8, topk_loss_mask_max_drop_percent=-1.0)
+
+
+# ---------------------------------------------------------------------------
+# Mask-diff stats (used for WandB logging in trainer.py)
+# ---------------------------------------------------------------------------
+
+
+def _stats_from_masks(orig_mask, new_mask):
+    """Replicate the stats computation from Loss._maybe_apply_topk_loss_mask."""
+    orig_active = orig_mask.bool()
+    drop_mask = orig_active & ~new_mask.bool()
+    return {
+        "masked_tokens": drop_mask.sum().item(),
+        "eligible_tokens": orig_active.sum().item(),
+        "position_drop_counts": drop_mask.sum(dim=0).tolist(),
+    }
+
+
+def test_stats_normal_drop():
+    # Ranks: positions 0→1, 1→2, 2→3, 3→4. k=2 drops positions 2 and 3.
+    logits = _logits([[3.0, 1.0, 2.0, 0.0]] * 4)
+    labels = torch.tensor([[0, 2, 1, 3]])
+    orig_mask = torch.ones((1, 4), dtype=torch.bool)
+    new_mask = compute_topk_loss_mask(logits, labels, orig_mask, tp_pg=None, k=2)
+
+    stats = _stats_from_masks(orig_mask, new_mask)
+    assert stats["masked_tokens"] == 2
+    assert stats["eligible_tokens"] == 4
+    assert stats["position_drop_counts"] == [0, 0, 1, 1]
+
+
+def test_stats_eligible_uses_bool_count_not_sum_of_weights():
+    # Float weighted mask: eligible should be count of non-zero positions, not sum.
+    logits = _logits([[3.0, 1.0, 2.0, 0.0]] * 4)
+    labels = torch.tensor([[0, 2, 1, 3]])
+    orig_mask = torch.tensor([[0.5, 2.0, 0.5, 2.0]], dtype=torch.float32)
+    new_mask = compute_topk_loss_mask(logits, labels, orig_mask, tp_pg=None, k=2)
+
+    stats = _stats_from_masks(orig_mask, new_mask)
+    assert stats["eligible_tokens"] == 4  # 4 active positions, not sum 5.0
+    assert stats["masked_tokens"] == 2  # positions 2 and 3 dropped
+
+
+def test_stats_all_dropped_fallback_shows_zero_dropped():
+    # When all tokens would be dropped the mask falls back to the original,
+    # so no tokens are actually dropped and stats should reflect that.
+    logits = _logits([[3.0, 1.0, 2.0, 0.0]] * 2)
+    labels = torch.tensor([[1, 3]])  # token_ranks 3 and 4, both outside k=1
+    orig_mask = torch.ones((1, 2), dtype=torch.float32)
+    new_mask = compute_topk_loss_mask(logits, labels, orig_mask, tp_pg=None, k=1)
+
+    stats = _stats_from_masks(orig_mask, new_mask)
+    assert stats["masked_tokens"] == 0  # fallback preserved all tokens
+    assert stats["eligible_tokens"] == 2
+    assert stats["position_drop_counts"] == [0, 0]
+
+
+def test_stats_max_drop_percent_cap():
+    # 4 active tokens, k=1 would drop 3 but cap is 50% → only 2 dropped.
+    logits = _logits([[3.0, 1.0, 2.0, 0.0]] * 4)
+    labels = torch.tensor([[0, 2, 1, 3]])  # token_ranks 1, 2, 3, 4
+    orig_mask = torch.ones((1, 4), dtype=torch.bool)
+    new_mask = compute_topk_loss_mask(logits, labels, orig_mask, tp_pg=None, k=1, max_drop_percent=50.0)
+
+    stats = _stats_from_masks(orig_mask, new_mask)
+    assert stats["masked_tokens"] == 2
+    assert stats["eligible_tokens"] == 4
+
+
+def test_stats_with_already_masked_positions():
+    # Position 1 is pre-masked (False); stats should not count it as dropped.
+    logits = _logits([[3.0, 1.0, 2.0, 0.0]] * 4)
+    labels = torch.tensor([[0, 0, 1, 3]])  # token_ranks 1, 1, 3, 4
+    orig_mask = torch.tensor([[True, False, True, True]])
+    new_mask = compute_topk_loss_mask(logits, labels, orig_mask, tp_pg=None, k=2)
+
+    stats = _stats_from_masks(orig_mask, new_mask)
+    assert stats["eligible_tokens"] == 3  # only 3 active in original mask
+    assert stats["masked_tokens"] == 2    # positions 2 and 3 dropped by topk

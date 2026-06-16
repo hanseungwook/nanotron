@@ -234,6 +234,125 @@ def sharded_cross_entropy(
         return _ShardedCrossEntropy.apply(sharded_logits, target, group)
 
 
+@torch.no_grad()
+def compute_target_token_ranks(
+    sharded_logits,  # (..., local_vocab_size)
+    target,  # (...)
+    group: Optional[dist.ProcessGroup] = None,
+):
+    """Compute the token rank of each target token under the model's own logits.
+
+    The token-rank convention is ``token_rank = 1 + count(logit > target_logit)`` over the full
+    (possibly tensor-parallel sharded) vocabulary. A token rank of 1 means the target token
+    is the argmax of the model's distribution. Ties (vocab entries whose logit equals
+    the target logit) do NOT increase the token rank, which matches the tie behavior of
+    ``topk_logit_analysis/score_topk.py``.
+
+    For a tensor-parallel sharded vocabulary, each TP rank counts how many of its local
+    logits beat the target logit, then the counts are summed across ``group`` to get the
+    global token rank. The target logit itself is gathered from the shard that owns the target
+    id and broadcast via an all-reduce(SUM), mirroring the predicted-logit gather in
+    ``_ShardedCrossEntropy``.
+
+    Args:
+        sharded_logits: logits for this TP rank's vocab shard, shape ``(..., local_vocab_size)``.
+        target: target token ids (global vocab indices), shape ``(...)``.
+        group: tensor-parallel process group the vocab is sharded over. ``None`` (or a
+            group of size 1) means the full vocabulary is local and no communication is done.
+
+    Returns:
+        A ``torch.long`` tensor of shape ``target.shape`` with the global 1-based token rank.
+    """
+    sharded_vocab_size = sharded_logits.shape[-1]
+    tp_rank = dist.get_rank(group) if group is not None else 0
+    tp_world_size = dist.get_world_size(group) if group is not None else 1
+    start_index = tp_rank * sharded_vocab_size
+    end_index = start_index + sharded_vocab_size
+
+    # Gather the logit assigned to each target token; only the owning shard holds it.
+    target_outside_shard = (target < start_index) | (target >= end_index)
+    local_target = target - start_index
+    local_target = local_target.masked_fill(target_outside_shard, 0)
+    logits_2d = sharded_logits.reshape(-1, sharded_vocab_size)
+    local_target_1d = local_target.reshape(-1)
+    arange_1d = torch.arange(0, logits_2d.shape[0], device=logits_2d.device)
+    target_logits = logits_2d[arange_1d, local_target_1d].view_as(target)
+    target_logits = target_logits.masked_fill(target_outside_shard, 0.0)
+    if tp_world_size > 1:
+        dist.all_reduce(target_logits, op=dist.ReduceOp.SUM, group=group)
+
+    # Compare in the logits' dtype; ties from low precision intentionally follow the strict-`>` convention.
+    local_greater = (sharded_logits > target_logits.unsqueeze(-1)).sum(dim=-1)
+    if tp_world_size > 1:
+        dist.all_reduce(local_greater, op=dist.ReduceOp.SUM, group=group)
+
+    return 1 + local_greater.long()
+
+
+@torch.no_grad()
+def compute_topk_loss_mask(
+    sharded_logits,  # [batch_size, seq_length, local_vocab_size]
+    label_ids,  # [batch_size, seq_length]
+    label_mask,  # [batch_size, seq_length]
+    tp_pg: Optional[dist.ProcessGroup],
+    k: int,
+    max_drop_percent: float = 100.0,
+):
+    """Mask out target tokens that fall outside the model's own top-K predictions.
+
+    Self-scoring: the model's current logits assign a token rank to each target token via
+    ``token_rank = 1 + count(logit > target_logit)`` over the full (tensor-parallel sharded)
+    vocabulary (see ``compute_target_token_ranks``). Tokens whose token rank is greater
+    than ``k`` are "unlikely" under the model and are dropped from the loss.
+
+    Only positions that the incoming ``label_mask`` already keeps are eligible to be
+    dropped, and kept positions retain their original ``label_mask`` value (e.g. a
+    weighted/float mask keeps its weight); dropped positions become zero. The returned
+    mask is therefore always element-wise ``<=`` the incoming mask.
+
+    ``max_drop_percent`` caps the fraction of currently-active tokens that may be dropped
+    in this forward microbatch. When more tokens than the cap qualify, the highest-token-rank
+    (most unlikely) ones are dropped first; ties at the cutoff token rank are broken deterministically by
+    position (lowest flat index first). A value of 100.0 (the default) means no cap.
+
+    If the top-K rule would drop every currently-active token, the top-K mask is skipped
+    for this call and the original ``label_mask`` is returned, avoiding an empty loss.
+
+    Returns a new mask with the same shape and dtype as ``label_mask``.
+    """
+    active = label_mask.bool()
+
+    token_ranks = compute_target_token_ranks(sharded_logits, label_ids, group=tp_pg)
+    # Candidate tokens to drop: currently active AND ranked outside the top-K.
+    drop_candidates = active & (token_ranks > k)
+
+    if max_drop_percent < 100.0:
+        num_active = int(active.sum().item())
+        max_drop = int((max_drop_percent / 100.0) * num_active)
+        num_candidates = int(drop_candidates.sum().item())
+        if num_candidates > max_drop:
+            if max_drop > 0:
+                # Keep only the `max_drop` most-unlikely (highest token rank) candidates as drops.
+                # Tie-break deterministically: a stable argsort over the ascending candidate
+                # indices means equal-token-rank candidates are dropped lowest-flat-index first.
+                cand_indices = drop_candidates.reshape(-1).nonzero(as_tuple=True)[0]
+                cand_token_ranks = token_ranks.reshape(-1)[cand_indices]
+                order = torch.argsort(cand_token_ranks, descending=True, stable=True)
+                chosen = cand_indices[order[:max_drop]]
+                flat_drop = torch.zeros(drop_candidates.numel(), dtype=torch.bool, device=drop_candidates.device)
+                flat_drop[chosen] = True
+                drop_candidates = flat_drop.reshape(drop_candidates.shape)
+            else:
+                drop_candidates = torch.zeros_like(drop_candidates)
+
+    kept_active = active & ~drop_candidates
+    would_empty_loss_mask = active.any() & ~kept_active.any()
+    drop_candidates = drop_candidates & ~would_empty_loss_mask
+
+    # Preserve original mask values for kept positions; zero out newly dropped ones.
+    return torch.where(drop_candidates, torch.zeros_like(label_mask), label_mask)
+
+
 class _ColumnLinearAsyncCommunication(torch.autograd.Function):
     """Adapted from https://github.com/NVIDIA/Megatron-LM/blob/e6d7e09845590d0a36bc7f29eb28db974fb8da4e/megatron/core/tensor_parallel/layers.py#L215"""
 
