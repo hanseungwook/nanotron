@@ -14,8 +14,9 @@ from nanotron.config import LlamaConfig as NanotronLlamaConfig, Qwen2Config as N
 from nanotron.config import NanotronConfigs
 from nanotron.models import init_on_device_and_dtype
 from nanotron.models.llama import LlamaForTraining
-from transformers import AutoTokenizer, LlamaForCausalLM
+from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaForCausalLM, Qwen2ForCausalLM
 from transformers import LlamaConfig as HFLlamaConfig
+from transformers import Qwen2Config as HFQwen2Config
 
 from .convert_weights import get_config_mapping, get_weight_mapping, load_nanotron_model
 
@@ -83,7 +84,19 @@ def convert_nt_to_hf(
     for module_name_hf, module_hf in hf_model.named_modules():
         for param_name_hf, param_hf in module_hf.named_parameters(recurse=False):
             # Get the Nanotron parameter
-            nanotron_key = hf_to_nt[f"{module_name_hf}.{param_name_hf}"]
+            hf_key = f"{module_name_hf}.{param_name_hf}"
+            if hf_key not in hf_to_nt:
+                if (
+                    isinstance(model_config, NanotronQwen2Config)
+                    and param_name_hf == "bias"
+                    and ".self_attn." in module_name_hf
+                    and module_name_hf.endswith((".q_proj", ".k_proj", ".v_proj"))
+                ):
+                    with torch.no_grad():
+                        param_hf.zero_()
+                    continue
+                raise KeyError(hf_key)
+            nanotron_key = hf_to_nt[hf_key]
             param = nanotron_model_state_dict[nanotron_key]
 
             if "qkv_proj" in nanotron_key:
@@ -106,10 +119,11 @@ def convert_nt_to_hf(
                 param_hf.copy_(param)
 
 
-def get_hf_config(config: NanotronLlamaConfig) -> HFLlamaConfig:
+def get_hf_config(config: NanotronLlamaConfig) -> HFLlamaConfig | HFQwen2Config:
     """Converts a nanotron configuration to huggingface configuration."""
     attrs = {key: getattr(config, value) for key, value in get_config_mapping(nt_to_hf=False).items()}
-    return HFLlamaConfig(**attrs)
+    hf_config_cls = HFQwen2Config if isinstance(config, NanotronQwen2Config) else HFLlamaConfig
+    return hf_config_cls(**attrs)
 
 
 def convert_checkpoint_and_save(
@@ -129,11 +143,13 @@ def convert_checkpoint_and_save(
     nanotron_model = load_nanotron_model(
         model_config=model_config,
         checkpoint_path=checkpoint_path,
+        config_cls=config_cls,
     )
     # Init huggingface model.
     with init_on_device_and_dtype(torch.device("cuda"), torch.bfloat16):
         model_config_hf = get_hf_config(model_config)
-        hf_model = LlamaForCausalLM._from_config(model_config_hf)
+        hf_model_cls = Qwen2ForCausalLM if config_cls == NanotronQwen2Config else LlamaForCausalLM
+        hf_model = hf_model_cls._from_config(model_config_hf)
 
     # Copy weights, initialize tokenizer and save model.
     if tokenizer_name is not None:
@@ -152,7 +168,7 @@ def check_converted_model_generation(save_path: Path):
     input_ids = tokenizer(TEST_PROMPT, return_tensors="pt")["input_ids"].cuda()
     print("Inputs:", tokenizer.batch_decode(input_ids))
 
-    model = LlamaForCausalLM.from_pretrained(save_path).cuda().bfloat16()
+    model = AutoModelForCausalLM.from_pretrained(save_path).cuda().bfloat16()
     out = model.generate(input_ids, max_new_tokens=100)
     print("Generation (converted): ", tokenizer.batch_decode(out))
 

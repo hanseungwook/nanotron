@@ -417,7 +417,7 @@ class TokenizedBytesFolderDataset(DatatroveFolderDataset):
                     raise RuntimeError(f"Failed to read cache file on rank {dist.get_rank()}: {e}")
 
         super().__init__(
-            folder_path=folder_path,
+            data_folder=folder_path,
             seq_len=seq_len,
             filename_pattern=filename_pattern,
             recursive=recursive,

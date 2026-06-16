@@ -64,7 +64,7 @@ class Nanoset(torch.utils.data.Dataset):
         for dataset_folder in self.dataset_folders:
             self.datatrove_datasets.append(
                 DatatroveFolderDataset(
-                    folder_path=dataset_folder,
+                    data_folder=dataset_folder,
                     seq_len=sequence_length,
                     token_size=self.token_size,
                     shuffle=True,
@@ -120,7 +120,10 @@ class Nanoset(torch.utils.data.Dataset):
         """
         stats = {}
         for dataset_idx, dataset in enumerate(self.datatrove_datasets):
-            stats[dataset.folder_path.path] = {"tokens": self.consumed_tokens[dataset_idx]}
+            folder_path = dataset.folder_path
+            if hasattr(folder_path, "path"):
+                folder_path = folder_path.path
+            stats[str(folder_path)] = {"tokens": self.consumed_tokens[dataset_idx]}
         return stats
 
     def __len__(self) -> int:

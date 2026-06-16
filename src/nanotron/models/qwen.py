@@ -1,3 +1,4 @@
+import math
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -21,7 +22,7 @@ from nanotron.parallel import ParallelContext
 from nanotron.parallel.parameters import NanotronParameter
 from nanotron.parallel.pipeline_parallel.block import PipelineBlock, TensorPointer
 from nanotron.parallel.pipeline_parallel.p2p import P2P
-from nanotron.parallel.tensor_parallel.functional import sharded_cross_entropy
+from nanotron.parallel.tensor_parallel.functional import compute_topk_loss_mask, sharded_cross_entropy
 from nanotron.parallel.tensor_parallel.nn import (
     TensorParallelColumnLinear,
     TensorParallelEmbedding,
@@ -794,10 +795,99 @@ def masked_mean(loss, label_mask, dtype):
     return (loss * label_mask).sum(dtype=dtype) / label_mask.sum()
 
 
+HIGH_LOSS_MASK_OUTPUT_KEYS = {
+    "high_loss_masked_tokens",
+    "high_loss_eligible_tokens",
+    "high_loss_position_drop_counts",
+    "high_loss_example_label_ids",
+    "high_loss_example_drop_mask",
+    "high_loss_example_valid_mask",
+}
+
+
+TOPK_LOSS_MASK_OUTPUT_KEYS = {
+    "topk_loss_masked_tokens",
+    "topk_loss_eligible_tokens",
+    "topk_loss_position_drop_counts",
+}
+
+
+def _apply_high_loss_token_mask(
+    loss: torch.Tensor,
+    label_ids: torch.Tensor,
+    label_mask: torch.Tensor,
+    top_percent: float,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    valid_mask = label_mask.to(dtype=torch.bool)
+
+    if top_percent <= 0.0:
+        return label_mask, {}
+
+    valid_losses = loss.detach().masked_select(valid_mask)
+    valid_count = valid_losses.numel()
+    if valid_count <= 1:
+        drop_mask = torch.zeros_like(valid_mask, dtype=torch.bool)
+    else:
+        num_drop = min(math.ceil(valid_count * top_percent / 100.0), valid_count - 1)
+        drop_mask = torch.zeros_like(valid_mask, dtype=torch.bool)
+        if num_drop > 0:
+            _, top_indices = torch.topk(valid_losses, k=num_drop, largest=True, sorted=False)
+            valid_positions = valid_mask.nonzero(as_tuple=False)
+            selected_positions = valid_positions[top_indices]
+            drop_mask[selected_positions[:, 0], selected_positions[:, 1]] = True
+
+    filtered_mask = torch.where(drop_mask, torch.zeros_like(label_mask), label_mask)
+    masked_tokens = drop_mask.sum()
+    eligible_tokens = valid_mask.sum()
+
+    stats = {
+        "high_loss_masked_tokens": masked_tokens.detach().float(),
+        "high_loss_eligible_tokens": eligible_tokens.detach().float(),
+        "high_loss_position_drop_counts": drop_mask.sum(dim=0).detach().float(),
+        "high_loss_example_label_ids": label_ids[0].detach(),
+        "high_loss_example_drop_mask": drop_mask[0].detach(),
+        "high_loss_example_valid_mask": valid_mask[0].detach(),
+    }
+    return filtered_mask, stats
+
+
 class Loss(nn.Module):
-    def __init__(self, tp_pg: dist.ProcessGroup):
+    def __init__(
+        self,
+        tp_pg: dist.ProcessGroup,
+        high_loss_mask_top_percent: float = 0.0,
+        topk_loss_mask_enabled: bool = False,
+        topk_loss_mask_k: Optional[int] = None,
+        topk_loss_mask_max_drop_percent: float = 100.0,
+    ):
         super().__init__()
         self.tp_pg = tp_pg
+        self.high_loss_mask_top_percent = high_loss_mask_top_percent
+        self.topk_loss_mask_enabled = topk_loss_mask_enabled
+        self.topk_loss_mask_k = topk_loss_mask_k
+        self.topk_loss_mask_max_drop_percent = topk_loss_mask_max_drop_percent
+
+    def _maybe_apply_topk_loss_mask(self, sharded_logits, label_ids, label_mask):
+        if not self.topk_loss_mask_enabled:
+            return label_mask, {}
+
+        assert self.topk_loss_mask_k is not None
+        orig_active = label_mask.bool()
+        new_mask = compute_topk_loss_mask(
+            sharded_logits,
+            label_ids,
+            label_mask,
+            tp_pg=self.tp_pg,
+            k=self.topk_loss_mask_k,
+            max_drop_percent=self.topk_loss_mask_max_drop_percent,
+        )
+        drop_mask = orig_active & ~new_mask.bool()
+        stats = {
+            "topk_loss_masked_tokens": drop_mask.sum().detach().float(),
+            "topk_loss_eligible_tokens": orig_active.sum().detach().float(),
+            "topk_loss_position_drop_counts": drop_mask.sum(dim=0).detach().float(),
+        }
+        return new_mask, stats
 
     def forward(
         self,
@@ -806,14 +896,36 @@ class Loss(nn.Module):
         label_mask: torch.Tensor,  # [batch_size, seq_length]
     ) -> Dict[str, torch.Tensor]:
         sharded_logits = sharded_logits.view(label_ids.shape[0], label_ids.shape[1], -1)
+        label_mask, stats = self._maybe_apply_topk_loss_mask(sharded_logits, label_ids, label_mask)
         loss = sharded_cross_entropy(sharded_logits, label_ids.contiguous(), group=self.tp_pg, dtype=torch.float)
+        if not self.topk_loss_mask_enabled:
+            label_mask, stats = _apply_high_loss_token_mask(
+                loss=loss,
+                label_ids=label_ids,
+                label_mask=label_mask,
+                top_percent=self.high_loss_mask_top_percent,
+            )
         loss = masked_mean(loss, label_mask, dtype=torch.float)
-        return {"loss": loss}
+        return {"loss": loss, **stats}
 
 
 class LossWithZLoss(Loss):
-    def __init__(self, tp_pg: dist.ProcessGroup, z_loss_coefficient: float):
-        super().__init__(tp_pg)
+    def __init__(
+        self,
+        tp_pg: dist.ProcessGroup,
+        z_loss_coefficient: float,
+        high_loss_mask_top_percent: float = 0.0,
+        topk_loss_mask_enabled: bool = False,
+        topk_loss_mask_k: Optional[int] = None,
+        topk_loss_mask_max_drop_percent: float = 100.0,
+    ):
+        super().__init__(
+            tp_pg=tp_pg,
+            high_loss_mask_top_percent=high_loss_mask_top_percent,
+            topk_loss_mask_enabled=topk_loss_mask_enabled,
+            topk_loss_mask_k=topk_loss_mask_k,
+            topk_loss_mask_max_drop_percent=topk_loss_mask_max_drop_percent,
+        )
         self.z_loss_coef = z_loss_coefficient
 
     def forward(
@@ -823,12 +935,20 @@ class LossWithZLoss(Loss):
         label_mask: torch.Tensor,  # [batch_size, seq_length]
     ) -> Dict[str, torch.Tensor]:
         sharded_logits = sharded_logits.view(label_ids.shape[0], label_ids.shape[1], -1)
+        label_mask, stats = self._maybe_apply_topk_loss_mask(sharded_logits, label_ids, label_mask)
         loss, z_loss = sharded_cross_entropy(
             sharded_logits, label_ids.contiguous(), group=self.tp_pg, dtype=torch.float, z_loss_coef=self.z_loss_coef
         )
+        if not self.topk_loss_mask_enabled:
+            label_mask, stats = _apply_high_loss_token_mask(
+                loss=loss,
+                label_ids=label_ids,
+                label_mask=label_mask,
+                top_percent=self.high_loss_mask_top_percent,
+            )
         loss = masked_mean(loss, label_mask, dtype=torch.float)
         z_loss = masked_mean(z_loss.detach(), label_mask, dtype=torch.float)
-        return {"loss": loss, "z_loss": z_loss}
+        return {"loss": loss, "z_loss": z_loss, **stats}
 
 
 class Qwen2ForTraining(NanotronModel):
@@ -845,9 +965,21 @@ class Qwen2ForTraining(NanotronModel):
         # Choose the appropriate loss class based on config
         loss_kwargs = {
             "tp_pg": parallel_context.tp_pg,
+            "high_loss_mask_top_percent": config.high_loss_mask_top_percent,
+            "topk_loss_mask_enabled": config.topk_loss_mask_enabled,
+            "topk_loss_mask_k": config.topk_loss_mask_k,
+            "topk_loss_mask_max_drop_percent": config.topk_loss_mask_max_drop_percent,
         }
         if config.z_loss_enabled:
             loss_kwargs["z_loss_coefficient"] = config.z_loss_coefficient
+
+        loss_output_keys = {"loss"}
+        if config.high_loss_mask_top_percent > 0.0:
+            loss_output_keys |= HIGH_LOSS_MASK_OUTPUT_KEYS
+        if config.topk_loss_mask_enabled:
+            loss_output_keys |= TOPK_LOSS_MASK_OUTPUT_KEYS
+        if config.z_loss_enabled:
+            loss_output_keys.add("z_loss")
 
         self.loss = PipelineBlock(
             p2p=self.model.p2p,
@@ -858,7 +990,7 @@ class Qwen2ForTraining(NanotronModel):
                 "label_ids",
                 "label_mask",
             },
-            module_output_keys={"loss", "z_loss"} if config.z_loss_enabled else {"loss"},
+            module_output_keys=loss_output_keys,
         )
         self.parallel_context = parallel_context
         self.config = config
@@ -880,10 +1012,7 @@ class Qwen2ForTraining(NanotronModel):
             label_ids=label_ids,
             label_mask=label_mask,
         )
-        if self.config.z_loss_enabled:
-            return {"loss": loss["loss"], "z_loss": loss["z_loss"]}
-        else:
-            return {"loss": loss["loss"]}
+        return loss
 
     @torch.no_grad()
     def init_model_randomly(self, config: Config):

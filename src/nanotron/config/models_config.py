@@ -143,6 +143,12 @@ class Qwen2Config:
     sliding_window_size: Optional[int] = None
     z_loss_enabled: bool = False  # Z-loss regularization https://www.jmlr.org/papers/volume24/22-1144/22-1144.pdf
     z_loss_coefficient: float = 0.0001  # Default from the paper (10^-4)
+    high_loss_mask_top_percent: float = 0.0
+    # Top-K unlikely-token loss masking: drop targets whose self-scored token
+    # rank is greater than K. Named to avoid generation/MoE `top_k` confusion.
+    topk_loss_mask_enabled: bool = False
+    topk_loss_mask_k: Optional[int] = None
+    topk_loss_mask_max_drop_percent: float = 100.0
     no_rope_layer: Optional[
         int
     ] = None  # Skip rope every no_rope_layer layers (see https://arxiv.org/abs/2501.18795 https://arxiv.org/abs/2305.19466 and Llama4)
@@ -192,6 +198,23 @@ class Qwen2Config:
             assert (
                 self.num_hidden_layers % self.no_rope_layer == 0
             ), "no_rope_layer must be a multiple of num_hidden_layers"
+        assert (
+            0.0 <= self.high_loss_mask_top_percent < 100.0
+        ), "high_loss_mask_top_percent must be in [0, 100)"
+        assert (
+            0.0 <= self.topk_loss_mask_max_drop_percent <= 100.0
+        ), "topk_loss_mask_max_drop_percent must be in [0, 100]"
+        if self.topk_loss_mask_enabled:
+            assert (
+                self.topk_loss_mask_k is not None
+            ), "topk_loss_mask_k must be set when topk_loss_mask_enabled is True"
+            assert self.topk_loss_mask_k > 0, f"topk_loss_mask_k must be > 0, got {self.topk_loss_mask_k}"
+            assert (
+                self.topk_loss_mask_k < self.vocab_size
+            ), f"topk_loss_mask_k ({self.topk_loss_mask_k}) must be < vocab_size ({self.vocab_size})"
+            assert (
+                self.high_loss_mask_top_percent <= 0.0
+            ), "high_loss_mask_top_percent and topk_loss_mask_enabled should not both be enabled"
 
     @property
     def is_using_mup(self) -> bool:
