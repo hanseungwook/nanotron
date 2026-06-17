@@ -33,6 +33,8 @@ def reference_rank_checksum(token_window) -> int:
     a = int(token_window[0])
     b = int(token_window[n // 2])
     c = int(token_window[-1])
+    # 1000003 (a large prime) and 9176 are arbitrary fixed mixers; any fixed pair works. This is
+    # an alignment tripwire, not a cryptographic hash.
     return (a * 1000003 + b * 9176 + c + n) % _REFERENCE_RANK_CHECKSUM_MOD
 
 

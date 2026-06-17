@@ -9,6 +9,8 @@ torchrun --nproc_per_node=8 run_train.py --config-file examples/config_tiny_llam
 """
 
 import argparse
+import glob
+import json
 import time
 from pprint import pformat
 from typing import Dict, Optional, cast
@@ -136,6 +138,40 @@ def _log_stage_start_plan(
 
 # import lovely_tensors as lt
 # lt.monkey_patch()
+
+
+def _validate_rank_sidecar_metadata(rank_folders, *, expected_regime, seq_len, token_size, vocab_size):
+    """Validate reference-rank sidecar metadata against the training config.
+
+    The per-window checksum is computed over tokens only, so it cannot detect a sidecar scored
+    in the wrong regime / seq_len / tokenizer — this catches those and fails loudly before training.
+    """
+    for folder in rank_folders:
+        meta_files = sorted(glob.glob(f"{folder}/_rank_sidecar.*.metadata"))
+        if not meta_files:
+            raise ValueError(
+                f"No _rank_sidecar.*.metadata found in reference-rank folder {folder}; (re)generate sidecars "
+                f"with generate_rank_sidecar.py so the scoring regime can be validated."
+            )
+        for mf in meta_files:
+            with open(mf) as f:
+                meta = json.load(f)
+            if meta.get("regime") != expected_regime:
+                raise ValueError(
+                    f"reference-rank sidecar regime mismatch in {mf}: scored '{meta.get('regime')}' but training "
+                    f"expects '{expected_regime}'. Re-score with --regime {expected_regime}."
+                )
+            if meta.get("seq_len") != seq_len:
+                raise ValueError(f"reference-rank sidecar seq_len mismatch in {mf}: {meta.get('seq_len')} != {seq_len}.")
+            if meta.get("token_size") != token_size:
+                raise ValueError(
+                    f"reference-rank sidecar token_size mismatch in {mf}: {meta.get('token_size')} != {token_size}."
+                )
+            if vocab_size is not None and meta.get("vocab_size") is not None and meta["vocab_size"] < vocab_size:
+                raise ValueError(
+                    f"reference-rank teacher vocab_size {meta['vocab_size']} < trainee vocab_size {vocab_size} in "
+                    f"{mf}: teacher cannot rank all trainee token ids (tokenizer mismatch?)."
+                )
 
 
 def get_dataloader_from_data_stage(
@@ -284,10 +320,29 @@ def get_dataloader_from_data_stage(
             # Offline reference-model top-k masking: load the per-token teacher rank sidecars
             # (parallel to dataset_folder) iff the model is configured for that source.
             reference_offline = getattr(trainer.model_config, "topk_loss_mask_source", "self") == "reference_offline"
-            if reference_offline and data.dataset.rank_dataset_folder is None:
-                raise ValueError(
-                    "topk_loss_mask_source='reference_offline' requires data.dataset.rank_dataset_folder "
-                    "(one rank sidecar folder per dataset_folder); otherwise training would run silently unmasked."
+            # The Nanoset path runs cross-document attention; reference sidecars must be scored in
+            # the matching regime (cross_doc <-> use_doc_masking=False). Tie both to one variable.
+            use_doc_masking = False
+            if reference_offline:
+                if data.dataset.rank_dataset_folder is None:
+                    raise ValueError(
+                        "topk_loss_mask_source='reference_offline' requires data.dataset.rank_dataset_folder "
+                        "(one rank sidecar folder per dataset_folder); otherwise training would run silently unmasked."
+                    )
+                _validate_rank_sidecar_metadata(
+                    data.dataset.rank_dataset_folder,
+                    expected_regime="doc_masked" if use_doc_masking else "cross_doc",
+                    seq_len=trainer.sequence_length,
+                    token_size=data.dataset.token_size_in_bytes,
+                    vocab_size=data.dataset.vocab_size,
+                )
+            elif data.dataset.rank_dataset_folder is not None:
+                log_rank(
+                    "rank_dataset_folder is set but topk_loss_mask_source != 'reference_offline'; "
+                    "the reference-rank sidecars will be ignored.",
+                    logger=logger,
+                    level=logging.WARNING,
+                    rank=0,
                 )
             start_time = time.time()
             train_dataset = Nanoset(
@@ -320,7 +375,7 @@ def get_dataloader_from_data_stage(
             dataloader_num_workers=data.num_loading_workers,
             dataloader_drop_last=True,
             use_position_ids=True,
-            use_doc_masking=False,
+            use_doc_masking=use_doc_masking,
             emit_reference_ranks=reference_offline,
             dataloader_pin_memory=True,
         )

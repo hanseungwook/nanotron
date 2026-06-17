@@ -258,14 +258,14 @@ class DataCollatorForCLMWithPositionIds:
             result["label_ids"] = result["label_ids"][:, local_slice]  # (b, s/cp_size)
             result["label_mask"] = result["label_mask"][:, local_slice]  # (b, s/cp_size)
 
-            # Offline reference-model ranks: shift like label_ids ([:, 1:]) so ranks align with
-            # labels (sidecar window = [checksum, rank(t1), ..., rank(t_seqlen)]). A ones
-            # placeholder is used when the dataset carries no sidecar (validation) — masking is
-            # disabled there anyway; the placeholder just keeps the strict PP key-set satisfied.
+            # Offline reference-model ranks (topk_loss_mask_source="reference_offline").
             if self.emit_reference_ranks:
                 if "reference_ranks" in examples[0]:
+                    # sidecar window = [checksum, rank(t1), ...]; drop the sentinel ([:, 1:]) so
+                    # ranks align with label_ids (= input_ids[:, 1:]).
                     reference_ranks = np.vstack([examples[i]["reference_ranks"] for i in range(len(examples))])[:, 1:]
                 else:
+                    # validation: no sidecar -> ones placeholder keeps the strict PP key-set satisfied.
                     reference_ranks = np.ones((batch_size, self.sequence_length), dtype=np.int64)
                 result["reference_ranks"] = reference_ranks[:, local_slice]  # (b, s/cp_size)
 

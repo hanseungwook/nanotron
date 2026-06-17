@@ -880,9 +880,9 @@ class Loss(nn.Module):
         assert self.topk_loss_mask_k is not None
         orig_active = label_mask.bool()
         if not self.masking_active:
-            # Validation: never mask. new_mask == label_mask makes the stats below all-zero
-            # while still emitting the declared TOPK_LOSS_MASK_OUTPUT_KEYS (PipelineBlock
-            # validates output keys exactly).
+            # Validation: never mask. new_mask == label_mask makes the stats below all-zero while
+            # still populating the topk_loss_* stats keys (the PipelineBlock validates the loss
+            # block's output keys exactly).
             new_mask = label_mask
         elif self.topk_loss_mask_source == "reference_offline":
             assert reference_ranks is not None, (
