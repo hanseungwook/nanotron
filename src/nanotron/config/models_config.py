@@ -149,6 +149,9 @@ class Qwen2Config:
     topk_loss_mask_enabled: bool = False
     topk_loss_mask_k: Optional[int] = None
     topk_loss_mask_max_drop_percent: float = 100.0
+    # Rank source for top-K masking: "self" (trainee's own logits) or "reference_offline"
+    # (precomputed teacher ranks read from a parallel dataset sidecar via the dataloader).
+    topk_loss_mask_source: str = "self"
     no_rope_layer: Optional[
         int
     ] = None  # Skip rope every no_rope_layer layers (see https://arxiv.org/abs/2501.18795 https://arxiv.org/abs/2305.19466 and Llama4)
@@ -215,6 +218,10 @@ class Qwen2Config:
             assert (
                 self.high_loss_mask_top_percent <= 0.0
             ), "high_loss_mask_top_percent and topk_loss_mask_enabled should not both be enabled"
+            assert self.topk_loss_mask_source in (
+                "self",
+                "reference_offline",
+            ), f"topk_loss_mask_source must be 'self' or 'reference_offline', got {self.topk_loss_mask_source!r}"
 
     @property
     def is_using_mup(self) -> bool:

@@ -146,6 +146,9 @@ class S3UploadArgs:
 class NanosetDatasetsArgs:
     dataset_folder: Union[str, List[str]]
     dataset_weights: Optional[List[float]] = None
+    # Parallel folders of per-token reference-model rank sidecars (uint16 .ds), one per
+    # dataset_folder, used when the model's topk_loss_mask_source == "reference_offline".
+    rank_dataset_folder: Optional[Union[str, List[str]]] = None
     dataset_read_path: Optional[
         Union[str, List[str]]
     ] = None  # Path to local file/copy to read from. If it exists, we read from this folder instead of from dataset_folder. Useful when we offload some data to remote and only keep the needed files on disk.
@@ -174,6 +177,16 @@ class NanosetDatasetsArgs:
             raise ValueError(
                 f"Number of dataset weights ({len(self.dataset_weights)}) does not match number of dataset folders ({len(self.dataset_folder)})"
             )
+
+        # Reference-rank sidecar folders, parallel to dataset_folder (offline teacher top-k).
+        if self.rank_dataset_folder is not None:
+            if isinstance(self.rank_dataset_folder, str):
+                self.rank_dataset_folder = [self.rank_dataset_folder]
+            if len(self.rank_dataset_folder) != len(self.dataset_folder):
+                raise ValueError(
+                    f"Number of rank_dataset_folder ({len(self.rank_dataset_folder)}) does not match "
+                    f"number of dataset folders ({len(self.dataset_folder)})"
+                )
 
         # Read the first metadata file in the dataset folder to extract tokenizer name and token size.
         for folder in self.dataset_folder:

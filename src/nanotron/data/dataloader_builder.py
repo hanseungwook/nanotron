@@ -30,6 +30,7 @@ def build_nanoset_dataloader(
     dataloader_pin_memory: bool = True,
     use_position_ids: bool = True,
     use_doc_masking: bool = True,
+    emit_reference_ranks: bool = False,
 ) -> DataLoader:
 
     # Case of ranks not requiring data. We give them a dummy dataset, then the collator will do his job
@@ -46,6 +47,7 @@ def build_nanoset_dataloader(
             output_pp_rank=output_pp_rank,
             parallel_context=parallel_context,
             use_doc_masking=use_doc_masking,
+            emit_reference_ranks=emit_reference_ranks,
         )
     else:
         data_collator = DataCollatorForCLM(

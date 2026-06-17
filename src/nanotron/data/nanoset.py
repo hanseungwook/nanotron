@@ -16,6 +16,25 @@ from nanotron.logging import log_rank
 
 logger = logging.get_logger(__name__)
 
+# datatrove's DatatroveFolderDataset default shuffle seed. Token and reference-rank sidecar
+# datasets must share it so their file-order permutations match index-for-index.
+_DATATROVE_SHUFFLE_SEED = 42
+_REFERENCE_RANK_CHECKSUM_MOD = 65521  # largest prime < 2**16; fits the uint16 sentinel slot
+
+
+def reference_rank_checksum(token_window) -> int:
+    """16-bit fingerprint of a token window (input_ids, length seq_len+1).
+
+    The offline rank-sidecar generator stores this in each window's sentinel slot
+    (index 0, dropped by the collator's [:, 1:] shift); Nanoset re-validates it at read
+    time to catch token/sidecar misalignment. MUST stay identical in the generator.
+    """
+    n = len(token_window)
+    a = int(token_window[0])
+    b = int(token_window[n // 2])
+    c = int(token_window[-1])
+    return (a * 1000003 + b * 9176 + c + n) % _REFERENCE_RANK_CHECKSUM_MOD
+
 
 class Nanoset(torch.utils.data.Dataset):
     """
@@ -40,6 +59,7 @@ class Nanoset(torch.utils.data.Dataset):
         use_cache: bool = True,
         eos_token_id: int = None,
         return_positions: bool = True,
+        rank_dataset_folders: Union[List[str], None] = None,
     ) -> None:
         # Checks
         if isinstance(dataset_folders, str):
@@ -60,17 +80,30 @@ class Nanoset(torch.utils.data.Dataset):
         self.random_seed = random_seed
         self.use_cache = use_cache
         self.cache_dir = "./.nanoset_cache"
-        self.datatrove_datasets = []
-        for dataset_folder in self.dataset_folders:
-            self.datatrove_datasets.append(
-                DatatroveFolderDataset(
-                    data_folder=dataset_folder,
-                    seq_len=sequence_length,
-                    token_size=self.token_size,
-                    shuffle=True,
-                    return_positions=self.return_positions,  # if set to True, the position ids are directly build datatrove
-                )
+        self.rank_dataset_folders = rank_dataset_folders
+        self.datatrove_datasets = [
+            self._build_datatrove_dataset(folder, token_size=self.token_size, return_positions=self.return_positions)
+            for folder in self.dataset_folders
+        ]
+        # Offline reference-model top-k masking: a parallel sidecar of per-token teacher ranks
+        # (uint16 .ds, token_size=2), one folder per token folder, read through the SAME builder
+        # so datatrove's file-order permutation matches the token datasets index-for-index.
+        self.rank_datasets = None
+        if rank_dataset_folders is not None:
+            assert len(rank_dataset_folders) == len(self.dataset_folders), (
+                f"Got {len(rank_dataset_folders)} rank_dataset_folders for "
+                f"{len(self.dataset_folders)} dataset_folders; they must be parallel."
             )
+            self.rank_datasets = [
+                self._build_datatrove_dataset(folder, token_size=2, return_positions=False)
+                for folder in rank_dataset_folders
+            ]
+            for i, (tok_ds, rank_ds) in enumerate(zip(self.datatrove_datasets, self.rank_datasets)):
+                assert len(rank_ds) == len(tok_ds), (
+                    f"reference-rank sidecar window-count mismatch for dataset {i}: "
+                    f"{len(rank_ds)} (ranks) vs {len(tok_ds)} (tokens) "
+                    f"[{rank_dataset_folders[i]} vs {self.dataset_folders[i]}]."
+                )
 
         # Build Nanoset Index
         ## To build the index we need the length of each dataset
@@ -92,6 +125,20 @@ class Nanoset(torch.utils.data.Dataset):
         self.print_nanoset_info()
         # Initialize consumption tracking
         self.consumed_tokens = dict.fromkeys(range(len(self.datatrove_datasets)), 0)
+
+    def _build_datatrove_dataset(self, folder: str, token_size: int, return_positions: bool) -> DatatroveFolderDataset:
+        """Build a DatatroveFolderDataset. Token and reference-rank sidecar datasets are built
+        through this single path with the SAME shuffle/seed, so datatrove's file-order
+        permutation is identical and per-index reads stay aligned (see reference_rank_checksum).
+        """
+        return DatatroveFolderDataset(
+            data_folder=folder,
+            seq_len=self.sequence_length,
+            token_size=token_size,
+            shuffle=True,
+            seed=_DATATROVE_SHUFFLE_SEED,
+            return_positions=return_positions,
+        )
 
     def update_consumption_metrics(self, start_idx: int, end_idx: int, sequence_length: int):
         """Update consumed samples/tokens for the current batch.
@@ -144,7 +191,19 @@ class Nanoset(torch.utils.data.Dataset):
         # Get actual sample index by wrapping around dataset length
         actual_sample = sample_idx % self.dataset_lengths[dataset]
 
-        return self.datatrove_datasets[dataset][actual_sample]
+        item = self.datatrove_datasets[dataset][actual_sample]
+        if self.rank_datasets is not None:
+            rank_window = self.rank_datasets[dataset][actual_sample]["input_ids"]  # (seq_len+1,)
+            # Alignment tripwire: the sidecar's sentinel slot stores a checksum of the token
+            # window. A mismatch means tokens and ranks drifted out of lockstep — fail loud.
+            expected = reference_rank_checksum(item["input_ids"])
+            got = int(rank_window[0])
+            assert got == expected, (
+                f"reference-rank sidecar misaligned (dataset {dataset}, sample {actual_sample}): "
+                f"sentinel {got} != token checksum {expected}."
+            )
+            item["reference_ranks"] = rank_window
+        return item
 
     def new_build_nanoset_index(self) -> Tuple[np.ndarray, np.ndarray]:
         """

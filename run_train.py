@@ -281,6 +281,14 @@ def get_dataloader_from_data_stage(
                 level=logging.INFO,
                 rank=0,
             )
+            # Offline reference-model top-k masking: load the per-token teacher rank sidecars
+            # (parallel to dataset_folder) iff the model is configured for that source.
+            reference_offline = getattr(trainer.model_config, "topk_loss_mask_source", "self") == "reference_offline"
+            if reference_offline and data.dataset.rank_dataset_folder is None:
+                raise ValueError(
+                    "topk_loss_mask_source='reference_offline' requires data.dataset.rank_dataset_folder "
+                    "(one rank sidecar folder per dataset_folder); otherwise training would run silently unmasked."
+                )
             start_time = time.time()
             train_dataset = Nanoset(
                 dataset_folders=data.dataset.dataset_folder,
@@ -291,6 +299,7 @@ def get_dataloader_from_data_stage(
                 random_seed=data.seed,
                 return_positions=data.dataset.return_positions,
                 eos_token_id=eos_token_id,
+                rank_dataset_folders=data.dataset.rank_dataset_folder if reference_offline else None,
             )
             end_time = time.time()
             log_rank(
@@ -312,6 +321,7 @@ def get_dataloader_from_data_stage(
             dataloader_drop_last=True,
             use_position_ids=True,
             use_doc_masking=False,
+            emit_reference_ranks=reference_offline,
             dataloader_pin_memory=True,
         )
         dist.barrier()
