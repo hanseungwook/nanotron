@@ -101,10 +101,13 @@ class Nanoset(torch.utils.data.Dataset):
                 for folder in rank_dataset_folders
             ]
             for i, (tok_ds, rank_ds) in enumerate(zip(self.datatrove_datasets, self.rank_datasets)):
-                assert len(rank_ds) == len(tok_ds), (
-                    f"reference-rank sidecar window-count mismatch for dataset {i}: "
-                    f"{len(rank_ds)} (ranks) vs {len(tok_ds)} (tokens) "
-                    f"[{rank_dataset_folders[i]} vs {self.dataset_folders[i]}]."
+                # Per-file (basename, window-count) must match so [actual_sample] aligns; a total-count
+                # check alone would miss a partially-regenerated/failed shard.
+                tok_files = [(os.path.basename(f.file_path), len(f)) for f in tok_ds.files]
+                rank_files = [(os.path.basename(f.file_path), len(f)) for f in rank_ds.files]
+                assert rank_files == tok_files, (
+                    f"reference-rank sidecar folder {rank_dataset_folders[i]} does not match token folder "
+                    f"{self.dataset_folders[i]} file-by-file (basename, window count)."
                 )
 
         # Build Nanoset Index

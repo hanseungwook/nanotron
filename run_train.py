@@ -147,7 +147,7 @@ def _validate_rank_sidecar_metadata(rank_folders, *, expected_regime, seq_len, t
     in the wrong regime / seq_len / tokenizer — this catches those and fails loudly before training.
     """
     for folder in rank_folders:
-        meta_files = sorted(glob.glob(f"{folder}/_rank_sidecar.*.metadata"))
+        meta_files = sorted(glob.glob(f"{folder}/_rank_sidecar*.metadata"))
         if not meta_files:
             raise ValueError(
                 f"No _rank_sidecar.*.metadata found in reference-rank folder {folder}; (re)generate sidecars "
@@ -156,6 +156,9 @@ def _validate_rank_sidecar_metadata(rank_folders, *, expected_regime, seq_len, t
         for mf in meta_files:
             with open(mf) as f:
                 meta = json.load(f)
+            for key in ("regime", "seq_len", "token_size", "vocab_size"):
+                if key not in meta:
+                    raise ValueError(f"reference-rank sidecar metadata {mf} is missing '{key}'; regenerate it.")
             if meta.get("regime") != expected_regime:
                 raise ValueError(
                     f"reference-rank sidecar regime mismatch in {mf}: scored '{meta.get('regime')}' but training "
@@ -167,7 +170,7 @@ def _validate_rank_sidecar_metadata(rank_folders, *, expected_regime, seq_len, t
                 raise ValueError(
                     f"reference-rank sidecar token_size mismatch in {mf}: {meta.get('token_size')} != {token_size}."
                 )
-            if vocab_size is not None and meta.get("vocab_size") is not None and meta["vocab_size"] < vocab_size:
+            if vocab_size is not None and meta["vocab_size"] < vocab_size:
                 raise ValueError(
                     f"reference-rank teacher vocab_size {meta['vocab_size']} < trainee vocab_size {vocab_size} in "
                     f"{mf}: teacher cannot rank all trainee token ids (tokenizer mismatch?)."

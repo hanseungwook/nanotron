@@ -222,6 +222,10 @@ class Qwen2Config:
                 "self",
                 "reference_offline",
             ), f"topk_loss_mask_source must be 'self' or 'reference_offline', got {self.topk_loss_mask_source!r}"
+        if self.topk_loss_mask_source == "reference_offline":
+            assert (
+                self.topk_loss_mask_enabled
+            ), "topk_loss_mask_source='reference_offline' requires topk_loss_mask_enabled=True"
 
     @property
     def is_using_mup(self) -> bool:
