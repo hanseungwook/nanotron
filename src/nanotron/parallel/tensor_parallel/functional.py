@@ -271,23 +271,28 @@ def compute_target_token_ranks(
 
 
 @torch.no_grad()
-def compute_topk_loss_mask(
-    sharded_logits,  # [batch_size, seq_length, local_vocab_size]
-    label_ids,  # [batch_size, seq_length]
+def mask_from_ranks(
+    token_ranks,  # [batch_size, seq_length] integer per-token ranks (1 = top logit)
     label_mask,  # [batch_size, seq_length]
-    tp_pg: Optional[dist.ProcessGroup],
     k: int,
     max_drop_percent: float = 100.0,
 ):
-    """Drop active target positions whose self-scored token rank is outside top-K.
+    """Apply the top-K drop policy given precomputed per-token ranks.
 
-    Kept positions retain their incoming ``label_mask`` value. Dropped positions
-    become zero. If the rule would drop every active token in the microbatch, the
-    original mask is returned to avoid an empty loss.
+    Drops active positions whose ``token_ranks > k``. ``max_drop_percent`` caps the
+    fraction of currently-active tokens dropped per microbatch; when more qualify,
+    the highest-rank (most unlikely) ones are dropped first, ties broken deterministically
+    by position (lowest flat index first). Kept positions retain their incoming
+    ``label_mask`` value (e.g. a weighted/float mask keeps its weight); dropped positions
+    become zero. If the rule would drop every currently-active token, the original mask is
+    returned to avoid an empty loss. The returned mask is always element-wise ``<=`` the
+    incoming mask.
+
+    The rank *source* is irrelevant: ``token_ranks`` may come from the model's own logits
+    (self-scoring, via ``compute_target_token_ranks``) or from a precomputed
+    reference/teacher signal supplied by the dataloader.
     """
     active = label_mask.bool()
-
-    token_ranks = compute_target_token_ranks(sharded_logits, label_ids, group=tp_pg)
     drop_candidates = active & (token_ranks > k)
 
     if max_drop_percent < 100.0:
@@ -311,6 +316,25 @@ def compute_topk_loss_mask(
     drop_candidates = drop_candidates & ~would_empty_loss_mask
 
     return torch.where(drop_candidates, torch.zeros_like(label_mask), label_mask)
+
+
+@torch.no_grad()
+def compute_topk_loss_mask(
+    sharded_logits,  # [batch_size, seq_length, local_vocab_size]
+    label_ids,  # [batch_size, seq_length]
+    label_mask,  # [batch_size, seq_length]
+    tp_pg: Optional[dist.ProcessGroup],
+    k: int,
+    max_drop_percent: float = 100.0,
+):
+    """Drop active target positions whose self-scored token rank is outside top-K.
+
+    Self-scoring convenience wrapper: computes per-token ranks from the model's own
+    (tensor-parallel sharded) logits via ``compute_target_token_ranks`` and applies
+    ``mask_from_ranks``. See ``mask_from_ranks`` for the full drop policy.
+    """
+    token_ranks = compute_target_token_ranks(sharded_logits, label_ids, group=tp_pg)
+    return mask_from_ranks(token_ranks, label_mask, k, max_drop_percent)
 
 
 class _ColumnLinearAsyncCommunication(torch.autograd.Function):

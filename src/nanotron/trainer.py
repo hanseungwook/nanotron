@@ -987,11 +987,24 @@ class DistributedTrainer:
         return outputs, loss_avg, z_loss_avg
 
     def validation_step(self, dataloader: Iterator[Dict[str, Union[torch.Tensor, TensorPointer]]]) -> Iterable[Dict]:
-        outputs = self.pipeline_engine.validate_batch_iter(
-            model=self.model,
-            batch=(next(dataloader) for _ in range(self.limit_val_batches)),
-            nb_microbatches=self.limit_val_batches,
-        )
+        # Validation loss is never masked: top-k self/reference masking is a training-time
+        # curriculum. nanotron never toggles model.eval(), so flip the loss module's flag
+        # explicitly. Outputs are materialized inside the no-mask window in case
+        # validate_batch_iter is lazy. No-op for models without top-k masking.
+        set_masking = getattr(self.unwrapped_model, "set_loss_masking", None)
+        if set_masking is not None:
+            set_masking(False)
+        try:
+            outputs = list(
+                self.pipeline_engine.validate_batch_iter(
+                    model=self.model,
+                    batch=(next(dataloader) for _ in range(self.limit_val_batches)),
+                    nb_microbatches=self.limit_val_batches,
+                )
+            )
+        finally:
+            if set_masking is not None:
+                set_masking(True)
         return outputs
 
     def train_step_logs(

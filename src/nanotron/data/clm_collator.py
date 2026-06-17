@@ -149,18 +149,26 @@ class DataCollatorForCLMWithPositionIds:
     output_pp_rank: int
     parallel_context: ParallelContext
     use_doc_masking: bool = True
+    # Emit per-token `reference_ranks` for offline reference-model top-k masking. Set iff the
+    # model's topk_loss_mask_source == "reference_offline" (keeps the loss block's strict
+    # module_input_keys in sync). When the dataset has no rank sidecar (validation), a ones
+    # placeholder is emitted so the key-set still matches.
+    emit_reference_ranks: bool = False
 
     def __call__(self, examples: List[Dict[str, List[np.ndarray]]]) -> Dict[str, Union[torch.Tensor, TensorPointer]]:
         # Process the case when current rank doesn't require data
         current_pp_rank = dist.get_rank(self.parallel_context.pp_pg)
         if current_pp_rank not in [self.input_pp_rank, self.output_pp_rank]:
             assert all(len(example) == 0 for example in examples)
-            return {
+            ptr_result = {
                 "input_ids": TensorPointer(group_rank=self.input_pp_rank),
                 "positions": TensorPointer(group_rank=self.input_pp_rank),
                 "label_ids": TensorPointer(group_rank=self.output_pp_rank),
                 "label_mask": TensorPointer(group_rank=self.output_pp_rank),
             }
+            if self.emit_reference_ranks:
+                ptr_result["reference_ranks"] = TensorPointer(group_rank=self.output_pp_rank)
+            return ptr_result
 
         # input_ids[0,:20]
         # array([  198,    50,    30, 12532,  3589,   198,    51,    30, 30618,
@@ -193,6 +201,8 @@ class DataCollatorForCLMWithPositionIds:
         result["position_ids"] = TensorPointer(group_rank=self.input_pp_rank)
         result["label_ids"] = TensorPointer(group_rank=self.output_pp_rank)
         result["label_mask"] = TensorPointer(group_rank=self.output_pp_rank)
+        if self.emit_reference_ranks:
+            result["reference_ranks"] = TensorPointer(group_rank=self.output_pp_rank)
 
         assert expanded_input_length == self.sequence_length + 1, (
             f"Samples should be of length {self.sequence_length + 1} (seq_len+1), " f"but got {expanded_input_length}"
@@ -247,6 +257,17 @@ class DataCollatorForCLMWithPositionIds:
             )
             result["label_ids"] = result["label_ids"][:, local_slice]  # (b, s/cp_size)
             result["label_mask"] = result["label_mask"][:, local_slice]  # (b, s/cp_size)
+
+            # Offline reference-model ranks (topk_loss_mask_source="reference_offline").
+            if self.emit_reference_ranks:
+                if "reference_ranks" in examples[0]:
+                    # sidecar window = [checksum, rank(t1), ...]; drop the sentinel ([:, 1:]) so
+                    # ranks align with label_ids (= input_ids[:, 1:]).
+                    reference_ranks = np.vstack([examples[i]["reference_ranks"] for i in range(len(examples))])[:, 1:]
+                else:
+                    # validation: no sidecar -> ones placeholder keeps the strict PP key-set satisfied.
+                    reference_ranks = np.ones((batch_size, self.sequence_length), dtype=np.int64)
+                result["reference_ranks"] = reference_ranks[:, local_slice]  # (b, s/cp_size)
 
         # Validate shapes
         if (

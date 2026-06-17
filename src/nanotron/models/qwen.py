@@ -22,7 +22,7 @@ from nanotron.parallel import ParallelContext
 from nanotron.parallel.parameters import NanotronParameter
 from nanotron.parallel.pipeline_parallel.block import PipelineBlock, TensorPointer
 from nanotron.parallel.pipeline_parallel.p2p import P2P
-from nanotron.parallel.tensor_parallel.functional import compute_topk_loss_mask, sharded_cross_entropy
+from nanotron.parallel.tensor_parallel.functional import compute_topk_loss_mask, mask_from_ranks, sharded_cross_entropy
 from nanotron.parallel.tensor_parallel.nn import (
     TensorParallelColumnLinear,
     TensorParallelEmbedding,
@@ -859,6 +859,7 @@ class Loss(nn.Module):
         topk_loss_mask_enabled: bool = False,
         topk_loss_mask_k: Optional[int] = None,
         topk_loss_mask_max_drop_percent: float = 100.0,
+        topk_loss_mask_source: str = "self",
     ):
         super().__init__()
         self.tp_pg = tp_pg
@@ -866,21 +867,43 @@ class Loss(nn.Module):
         self.topk_loss_mask_enabled = topk_loss_mask_enabled
         self.topk_loss_mask_k = topk_loss_mask_k
         self.topk_loss_mask_max_drop_percent = topk_loss_mask_max_drop_percent
+        # "self" scores ranks from the trainee's own logits; "reference_offline" reads
+        # precomputed teacher ranks supplied by the dataloader as ``reference_ranks``.
+        self.topk_loss_mask_source = topk_loss_mask_source
+        # Toggled off by the trainer around validation so validation loss is never masked.
+        self.masking_active = True
 
-    def _maybe_apply_topk_loss_mask(self, sharded_logits, label_ids, label_mask):
+    def _maybe_apply_topk_loss_mask(self, sharded_logits, label_ids, label_mask, reference_ranks=None):
         if not self.topk_loss_mask_enabled:
             return label_mask, {}
 
         assert self.topk_loss_mask_k is not None
         orig_active = label_mask.bool()
-        new_mask = compute_topk_loss_mask(
-            sharded_logits,
-            label_ids,
-            label_mask,
-            tp_pg=self.tp_pg,
-            k=self.topk_loss_mask_k,
-            max_drop_percent=self.topk_loss_mask_max_drop_percent,
-        )
+        if not self.masking_active:
+            # Validation: never mask. new_mask == label_mask makes the stats below all-zero while
+            # still populating the topk_loss_* stats keys (the PipelineBlock validates the loss
+            # block's output keys exactly).
+            new_mask = label_mask
+        elif self.topk_loss_mask_source == "reference_offline":
+            assert reference_ranks is not None, (
+                "topk_loss_mask_source='reference_offline' requires per-token reference_ranks "
+                "in the batch (offline teacher sidecar)."
+            )
+            new_mask = mask_from_ranks(
+                reference_ranks.reshape(label_ids.shape).long(),
+                label_mask,
+                k=self.topk_loss_mask_k,
+                max_drop_percent=self.topk_loss_mask_max_drop_percent,
+            )
+        else:
+            new_mask = compute_topk_loss_mask(
+                sharded_logits,
+                label_ids,
+                label_mask,
+                tp_pg=self.tp_pg,
+                k=self.topk_loss_mask_k,
+                max_drop_percent=self.topk_loss_mask_max_drop_percent,
+            )
         drop_mask = orig_active & ~new_mask.bool()
         stats = {
             "topk_loss_masked_tokens": drop_mask.sum().detach().float(),
@@ -894,9 +917,12 @@ class Loss(nn.Module):
         sharded_logits: torch.Tensor,  # [batch_size*seq_length, logits]
         label_ids: torch.Tensor,  # [batch_size, seq_length]
         label_mask: torch.Tensor,  # [batch_size, seq_length]
+        reference_ranks: Optional[torch.Tensor] = None,  # [batch_size, seq_length], offline teacher ranks
     ) -> Dict[str, torch.Tensor]:
         sharded_logits = sharded_logits.view(label_ids.shape[0], label_ids.shape[1], -1)
-        label_mask, stats = self._maybe_apply_topk_loss_mask(sharded_logits, label_ids, label_mask)
+        label_mask, stats = self._maybe_apply_topk_loss_mask(
+            sharded_logits, label_ids, label_mask, reference_ranks=reference_ranks
+        )
         loss = sharded_cross_entropy(sharded_logits, label_ids.contiguous(), group=self.tp_pg, dtype=torch.float)
         if not self.topk_loss_mask_enabled:
             label_mask, stats = _apply_high_loss_token_mask(
@@ -918,6 +944,7 @@ class LossWithZLoss(Loss):
         topk_loss_mask_enabled: bool = False,
         topk_loss_mask_k: Optional[int] = None,
         topk_loss_mask_max_drop_percent: float = 100.0,
+        topk_loss_mask_source: str = "self",
     ):
         super().__init__(
             tp_pg=tp_pg,
@@ -925,6 +952,7 @@ class LossWithZLoss(Loss):
             topk_loss_mask_enabled=topk_loss_mask_enabled,
             topk_loss_mask_k=topk_loss_mask_k,
             topk_loss_mask_max_drop_percent=topk_loss_mask_max_drop_percent,
+            topk_loss_mask_source=topk_loss_mask_source,
         )
         self.z_loss_coef = z_loss_coefficient
 
@@ -933,9 +961,12 @@ class LossWithZLoss(Loss):
         sharded_logits: torch.Tensor,  # [batch_size*seq_length, logits]
         label_ids: torch.Tensor,  # [batch_size, seq_length]
         label_mask: torch.Tensor,  # [batch_size, seq_length]
+        reference_ranks: Optional[torch.Tensor] = None,  # [batch_size, seq_length], offline teacher ranks
     ) -> Dict[str, torch.Tensor]:
         sharded_logits = sharded_logits.view(label_ids.shape[0], label_ids.shape[1], -1)
-        label_mask, stats = self._maybe_apply_topk_loss_mask(sharded_logits, label_ids, label_mask)
+        label_mask, stats = self._maybe_apply_topk_loss_mask(
+            sharded_logits, label_ids, label_mask, reference_ranks=reference_ranks
+        )
         loss, z_loss = sharded_cross_entropy(
             sharded_logits, label_ids.contiguous(), group=self.tp_pg, dtype=torch.float, z_loss_coef=self.z_loss_coef
         )
@@ -969,6 +1000,7 @@ class Qwen2ForTraining(NanotronModel):
             "topk_loss_mask_enabled": config.topk_loss_mask_enabled,
             "topk_loss_mask_k": config.topk_loss_mask_k,
             "topk_loss_mask_max_drop_percent": config.topk_loss_mask_max_drop_percent,
+            "topk_loss_mask_source": config.topk_loss_mask_source,
         }
         if config.z_loss_enabled:
             loss_kwargs["z_loss_coefficient"] = config.z_loss_coefficient
@@ -981,15 +1013,18 @@ class Qwen2ForTraining(NanotronModel):
         if config.z_loss_enabled:
             loss_output_keys.add("z_loss")
 
+        # Offline reference-model top-k masking threads per-token teacher ranks into the loss.
+        # PipelineBlock validates input keys exactly, so only declare reference_ranks when that
+        # source is active (the collator must then always supply it, incl. a val placeholder).
+        loss_module_input_keys = {"sharded_logits", "label_ids", "label_mask"}
+        if config.topk_loss_mask_source == "reference_offline":
+            loss_module_input_keys.add("reference_ranks")
+
         self.loss = PipelineBlock(
             p2p=self.model.p2p,
             module_builder=LossWithZLoss if config.z_loss_enabled else Loss,
             module_kwargs=loss_kwargs,
-            module_input_keys={
-                "sharded_logits",
-                "label_ids",
-                "label_mask",
-            },
+            module_input_keys=loss_module_input_keys,
             module_output_keys=loss_output_keys,
         )
         self.parallel_context = parallel_context
@@ -1002,17 +1037,34 @@ class Qwen2ForTraining(NanotronModel):
         position_ids: Union[torch.Tensor, TensorPointer],
         label_ids: Union[torch.Tensor, TensorPointer],
         label_mask: Union[torch.Tensor, TensorPointer],
+        reference_ranks: Union[torch.Tensor, TensorPointer, None] = None,
     ) -> Dict[str, Union[torch.Tensor, TensorPointer]]:
         sharded_logits = self.model(
             input_ids=input_ids,
             position_ids=position_ids,
         )
-        loss = self.loss(
-            sharded_logits=sharded_logits,
-            label_ids=label_ids,
-            label_mask=label_mask,
-        )
+        loss_kwargs = {
+            "sharded_logits": sharded_logits,
+            "label_ids": label_ids,
+            "label_mask": label_mask,
+        }
+        # Symmetric with the loss block's module_input_keys (set in __init__): the key is
+        # present iff the offline reference source is active, on every PP rank.
+        if self.config.topk_loss_mask_source == "reference_offline":
+            loss_kwargs["reference_ranks"] = reference_ranks
+        loss = self.loss(**loss_kwargs)
         return loss
+
+    def set_loss_masking(self, active: bool) -> None:
+        """Enable/disable top-k loss masking at runtime.
+
+        The trainer turns this off around ``validation_step`` so validation loss is never
+        masked (for both ``self`` and ``reference_offline`` sources). No-op on PP ranks
+        where the loss module isn't materialized (``pp_block`` only set on the owning rank).
+        """
+        block = getattr(self.loss, "pp_block", None)
+        if isinstance(block, Loss):
+            block.masking_active = active
 
     @torch.no_grad()
     def init_model_randomly(self, config: Config):
