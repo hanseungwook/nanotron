@@ -140,12 +140,22 @@ def _log_stage_start_plan(
 # lt.monkey_patch()
 
 
-def _validate_rank_sidecar_metadata(rank_folders, *, expected_regime, seq_len, token_size, vocab_size):
+def _validate_rank_sidecar_metadata(
+    rank_folders,
+    *,
+    expected_regime,
+    seq_len,
+    token_size,
+    vocab_size,
+    train_split_num_samples,
+    random_seed,
+):
     """Validate reference-rank sidecar metadata against the training config.
 
     The per-window checksum is computed over tokens only, so it cannot detect a sidecar scored
     in the wrong regime / seq_len / tokenizer — this catches those and fails loudly before training.
     """
+    warned_sparse_superset = False
     for folder in rank_folders:
         meta_files = sorted(glob.glob(f"{folder}/_rank_sidecar*.metadata"))
         if not meta_files:
@@ -159,6 +169,7 @@ def _validate_rank_sidecar_metadata(rank_folders, *, expected_regime, seq_len, t
             for key in ("regime", "seq_len", "token_size", "vocab_size"):
                 if key not in meta:
                     raise ValueError(f"reference-rank sidecar metadata {mf} is missing '{key}'; regenerate it.")
+            layout = meta.get("layout", "dense_datatrove")
             if meta.get("regime") != expected_regime:
                 raise ValueError(
                     f"reference-rank sidecar regime mismatch in {mf}: scored '{meta.get('regime')}' but training "
@@ -175,6 +186,47 @@ def _validate_rank_sidecar_metadata(rank_folders, *, expected_regime, seq_len, t
                     f"reference-rank teacher vocab_size {meta['vocab_size']} < trainee vocab_size {vocab_size} in "
                     f"{mf}: teacher cannot rank all trainee token ids (tokenizer mismatch?)."
                 )
+            if layout == "nanoset_sparse":
+                for key in (
+                    "num_shards",
+                    "shard_index",
+                    "num_samples",
+                    "sample_indices_file",
+                    "ranks_file",
+                    "train_split_num_samples",
+                    "random_seed",
+                    "sample_sharding",
+                ):
+                    if key not in meta:
+                        raise ValueError(f"sparse reference-rank metadata {mf} is missing '{key}'; regenerate it.")
+                if meta["sample_sharding"] != "actual_sample_mod_num_shards":
+                    raise ValueError(
+                        f"sparse reference-rank sidecar {mf} has unsupported sample_sharding="
+                        f"{meta['sample_sharding']!r}"
+                    )
+                sidecar_train_samples = int(meta["train_split_num_samples"])
+                required_train_samples = int(train_split_num_samples)
+                if sidecar_train_samples < required_train_samples:
+                    raise ValueError(
+                        f"sparse reference-rank sidecar train_split_num_samples mismatch in {mf}: "
+                        f"{sidecar_train_samples} < required {required_train_samples}"
+                    )
+                if sidecar_train_samples > required_train_samples and not warned_sparse_superset:
+                    log_rank(
+                        "Sparse reference-rank sidecar was generated for a larger Nanoset prefix; "
+                        f"using it as a superset for this run ({sidecar_train_samples} >= {required_train_samples}).",
+                        logger=logger,
+                        level=logging.WARNING,
+                        rank=0,
+                    )
+                    warned_sparse_superset = True
+                if int(meta["random_seed"]) != int(random_seed):
+                    raise ValueError(
+                        f"sparse reference-rank sidecar random_seed mismatch in {mf}: "
+                        f"{meta['random_seed']} != {random_seed}"
+                    )
+            elif layout != "dense_datatrove":
+                raise ValueError(f"Unsupported reference-rank sidecar layout {layout!r} in {mf}")
 
 
 def get_dataloader_from_data_stage(
@@ -338,6 +390,8 @@ def get_dataloader_from_data_stage(
                     seq_len=trainer.sequence_length,
                     token_size=data.dataset.token_size_in_bytes,
                     vocab_size=data.dataset.vocab_size,
+                    train_split_num_samples=trainer.config.tokens.train_steps * trainer.global_batch_size,
+                    random_seed=data.seed,
                 )
             elif data.dataset.rank_dataset_folder is not None:
                 log_rank(

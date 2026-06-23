@@ -22,6 +22,86 @@ _DATATROVE_SHUFFLE_SEED = 42
 _REFERENCE_RANK_CHECKSUM_MOD = 65521  # largest prime < 2**16; fits the uint16 sentinel slot
 
 
+class SparseReferenceRankDataset:
+    """Sparse offline teacher-rank sidecar keyed by Nanoset's actual_sample index."""
+
+    def __init__(self, folder: str, sequence_length: int) -> None:
+        self.folder = folder
+        self.sequence_length = sequence_length
+        self.width = sequence_length + 1
+        meta_files = sorted(
+            os.path.join(folder, name)
+            for name in os.listdir(folder)
+            if name.startswith("_rank_sidecar.") and name.endswith(".metadata")
+        )
+        if not meta_files:
+            raise ValueError(f"No sparse rank sidecar metadata found in {folder}")
+
+        self.indices = {}
+        self.ranks = {}
+        self.num_shards = None
+        for meta_file in meta_files:
+            with open(meta_file) as f:
+                meta = json.load(f)
+            if meta.get("layout") != "nanoset_sparse":
+                raise ValueError(f"{meta_file} is not a nanoset_sparse rank sidecar")
+            if int(meta["seq_len"]) != sequence_length:
+                raise ValueError(
+                    f"Sparse rank sidecar seq_len mismatch in {meta_file}: "
+                    f"{meta['seq_len']} != {sequence_length}"
+                )
+
+            num_shards = int(meta["num_shards"])
+            shard_index = int(meta["shard_index"])
+            if self.num_shards is None:
+                self.num_shards = num_shards
+            elif self.num_shards != num_shards:
+                raise ValueError(
+                    f"Sparse rank sidecar num_shards mismatch in {meta_file}: "
+                    f"{num_shards} != {self.num_shards}"
+                )
+            if shard_index in self.indices:
+                raise ValueError(f"Duplicate sparse rank sidecar shard {shard_index} in {folder}")
+
+            sample_indices_path = os.path.join(folder, meta["sample_indices_file"])
+            ranks_path = os.path.join(folder, meta["ranks_file"])
+            sample_indices = np.load(sample_indices_path, mmap_mode="r")
+            num_samples = int(meta["num_samples"])
+            if len(sample_indices) != num_samples:
+                raise ValueError(
+                    f"Sparse rank sidecar sample count mismatch in {meta_file}: "
+                    f"{len(sample_indices)} != {num_samples}"
+                )
+            if num_samples:
+                ranks = np.memmap(
+                    ranks_path,
+                    dtype=np.uint16,
+                    mode="r",
+                    shape=(num_samples, self.width),
+                )
+            else:
+                ranks = np.empty((0, self.width), dtype=np.uint16)
+            self.indices[shard_index] = sample_indices
+            self.ranks[shard_index] = ranks
+
+        if self.num_shards is None:
+            raise ValueError(f"No sparse rank sidecar shards loaded from {folder}")
+        missing = sorted(set(range(self.num_shards)) - set(self.indices))
+        if missing:
+            raise ValueError(f"Sparse rank sidecar folder {folder} is missing shards: {missing}")
+
+    def __getitem__(self, actual_sample: int) -> np.ndarray:
+        shard_index = int(actual_sample) % self.num_shards
+        sample_indices = self.indices[shard_index]
+        row = int(np.searchsorted(sample_indices, actual_sample))
+        if row >= len(sample_indices) or int(sample_indices[row]) != int(actual_sample):
+            raise KeyError(
+                f"Sparse rank sidecar {self.folder} does not contain actual_sample={actual_sample} "
+                f"in shard {shard_index}"
+            )
+        return self.ranks[shard_index][row]
+
+
 def reference_rank_checksum(token_window) -> int:
     """16-bit fingerprint of a token window (input_ids, length seq_len+1).
 
@@ -91,24 +171,35 @@ class Nanoset(torch.utils.data.Dataset):
         # (uint16 .ds, token_size=2), one folder per token folder, read through the SAME builder
         # so datatrove's file-order permutation matches the token datasets index-for-index.
         self.rank_datasets = None
+        self.rank_datasets_are_sparse = False
         if rank_dataset_folders is not None:
             assert len(rank_dataset_folders) == len(self.dataset_folders), (
                 f"Got {len(rank_dataset_folders)} rank_dataset_folders for "
                 f"{len(self.dataset_folders)} dataset_folders; they must be parallel."
             )
-            self.rank_datasets = [
-                self._build_datatrove_dataset(folder, token_size=2, return_positions=False)
-                for folder in rank_dataset_folders
-            ]
-            for i, (tok_ds, rank_ds) in enumerate(zip(self.datatrove_datasets, self.rank_datasets)):
-                # Per-file (basename, window-count) must match so [actual_sample] aligns; a total-count
-                # check alone would miss a partially-regenerated/failed shard.
-                tok_files = [(os.path.basename(f.file_path), len(f)) for f in tok_ds.files]
-                rank_files = [(os.path.basename(f.file_path), len(f)) for f in rank_ds.files]
-                assert rank_files == tok_files, (
-                    f"reference-rank sidecar folder {rank_dataset_folders[i]} does not match token folder "
-                    f"{self.dataset_folders[i]} file-by-file (basename, window count)."
-                )
+            sparse_flags = [self._rank_folder_is_sparse(folder) for folder in rank_dataset_folders]
+            if any(sparse_flags) and not all(sparse_flags):
+                raise ValueError("rank_dataset_folders must be all dense sidecars or all nanoset_sparse sidecars")
+            self.rank_datasets_are_sparse = all(sparse_flags)
+            if self.rank_datasets_are_sparse:
+                self.rank_datasets = [
+                    SparseReferenceRankDataset(folder, sequence_length=self.sequence_length)
+                    for folder in rank_dataset_folders
+                ]
+            else:
+                self.rank_datasets = [
+                    self._build_datatrove_dataset(folder, token_size=2, return_positions=False)
+                    for folder in rank_dataset_folders
+                ]
+                for i, (tok_ds, rank_ds) in enumerate(zip(self.datatrove_datasets, self.rank_datasets)):
+                    # Per-file (basename, window-count) must match so [actual_sample] aligns; a total-count
+                    # check alone would miss a partially-regenerated/failed shard.
+                    tok_files = [(os.path.basename(f.file_path), len(f)) for f in tok_ds.files]
+                    rank_files = [(os.path.basename(f.file_path), len(f)) for f in rank_ds.files]
+                    assert rank_files == tok_files, (
+                        f"reference-rank sidecar folder {rank_dataset_folders[i]} does not match token folder "
+                        f"{self.dataset_folders[i]} file-by-file (basename, window count)."
+                    )
 
         # Build Nanoset Index
         ## To build the index we need the length of each dataset
@@ -144,6 +235,18 @@ class Nanoset(torch.utils.data.Dataset):
             seed=_DATATROVE_SHUFFLE_SEED,
             return_positions=return_positions,
         )
+
+    @staticmethod
+    def _rank_folder_is_sparse(folder: str) -> bool:
+        if not os.path.isdir(folder):
+            return False
+        for name in os.listdir(folder):
+            if not (name.startswith("_rank_sidecar.") and name.endswith(".metadata")):
+                continue
+            with open(os.path.join(folder, name)) as f:
+                meta = json.load(f)
+            return meta.get("layout") == "nanoset_sparse"
+        return False
 
     def update_consumption_metrics(self, start_idx: int, end_idx: int, sequence_length: int):
         """Update consumed samples/tokens for the current batch.
@@ -198,7 +301,10 @@ class Nanoset(torch.utils.data.Dataset):
 
         item = self.datatrove_datasets[dataset][actual_sample]
         if self.rank_datasets is not None:
-            rank_window = self.rank_datasets[dataset][actual_sample]["input_ids"]  # (seq_len+1,)
+            if self.rank_datasets_are_sparse:
+                rank_window = self.rank_datasets[dataset][actual_sample]  # (seq_len+1,)
+            else:
+                rank_window = self.rank_datasets[dataset][actual_sample]["input_ids"]  # (seq_len+1,)
             # Alignment tripwire: the sidecar's sentinel slot stores a checksum of the token
             # window. A mismatch means tokens and ranks drifted out of lockstep — fail loud.
             expected = reference_rank_checksum(item["input_ids"])
